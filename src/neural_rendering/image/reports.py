@@ -47,13 +47,14 @@ def _write_report(
     gpu: dict,
     session: DLSSFrameSession,
     evidence: dict[str, object],
-    *, metadata_diagnostics: dict | None = None,
+    *, metadata_diagnostics: dict | None = None, iteration_reports: list[dict] | None = None,
 ) -> str:
     report = {
         "status": "success",
         "input": result.input_path,
         "output": result.output_path,
         "options": asdict(options),
+        "iterations": iteration_reports or [],
         "gpu": gpu,
         "decoder": decoded.decoder,
         "source_metadata": {

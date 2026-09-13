@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/config/
+/logs/
+/outputs/
+/jobs/
+/temp/
+/live/
+/backups/
+*.zip

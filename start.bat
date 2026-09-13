@@ -8,5 +8,6 @@ set "PYTHONNOUSERSITE=1"
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONIOENCODING=utf-8"
 set "GRADIO_ANALYTICS_ENABLED=False"
+set "GRADIO_SERVER_PORT=7865"
 "%~dp0bin\python-3.13.15-embed-amd64\python.exe" "%~dp0app.py"
 if errorlevel 1 pause

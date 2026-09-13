@@ -11,14 +11,16 @@ from ...core.disk_paths import prepare_output_dir
 from ...core.jobs import Cancelled, JobController, active_job
 from ...core.paths import LOGS
 from ..video.native import probe_capabilities
+from ...neural_rendering.image.models import NO_SAVE
 from .models import ImageUpscaleOptions, ImageUpscaleBatchResult, ImageUpscaleFailure
 from .processor import upscale_image
 
 
 def upscale_images(input_paths, options=None, progress=None, *, output_dir=None, controller=None,
-                   on_item_update=None, generate_previews=True):
+                   on_item_update=None, generate_previews=True, on_image=None):
     options = replace(options) if options else ImageUpscaleOptions()
     options.validate()
+    save_output = options.output_format != NO_SAVE
     paths = [Path(p).resolve() for p in input_paths]
     if not paths:
         raise ValueError("Choose at least one image.")
@@ -26,7 +28,7 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
     reporter = BatchProgress(paths, on_item_update, progress)
     successes, failures = [], []
     try:
-        destination = prepare_output_dir(output_dir)
+        destination = prepare_output_dir(output_dir) if save_output else None
         with active_job(controller):
             if controller.cancel.is_set():
                 raise Cancelled("Stopped before rendering.")
@@ -38,7 +40,7 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
                 try:
                     result = upscale_image(path, options, lambda v, m, i=i: reporter.advance(i, v, m),
                                            output_dir=destination, controller=controller, _owns_slot=True,
-                                           _capabilities=caps, generate_previews=generate_previews)
+                                           _capabilities=caps, generate_previews=generate_previews, on_image=on_image)
                 except Exception as exc:
                     cancelled = controller.cancel.is_set() or isinstance(exc, Cancelled)
                     failures.append(ImageUpscaleFailure(i, str(path), str(exc), cancelled))
@@ -48,12 +50,15 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
                         break
                 else:
                     successes.append(result)
-                    reporter.complete(i, result.output_path, "; ".join([*result.warnings, f"Report: {result.report_path}"]))
+                    reporter.complete(i, result.output_path, "; ".join([*result.warnings, f"Report: {result.report_path}" if save_output else "Not saved."]))
         if controller.cancel.is_set():
             for item in reporter.items:
                 if item.state == "Queued":
                     failures.append(ImageUpscaleFailure(item.index, item.input_path, "Cancelled before rendering.", True))
             reporter.skip_from(0)
+        if not save_output:
+            reporter.finish(cancelled=controller.cancel.is_set())
+            return ImageUpscaleBatchResult(successes, failures, controller.cancel.is_set(), "")
         LOGS.mkdir(exist_ok=True)
         manifest = LOGS / f"upscale-image-batch-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
         result = ImageUpscaleBatchResult(successes, failures, controller.cancel.is_set(), str(manifest))

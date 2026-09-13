@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import gradio as gr
+from PIL import Image
+from ...neural_rendering.image.models import NO_SAVE
 
 from ...core.batch_ui import (BATCH_HEADERS, bind_batch_ui, build_media_clear_button,
                              build_media_select_button, build_path_controls)
@@ -27,16 +29,22 @@ def options_from_values(values):
 
 def render_image_batch(paths, *values, progress=None, output_dir=None, controller=None,
                        on_item_update=None, direct_disk=False):
-    result = upscale_images(paths, options_from_values(values), progress, output_dir=output_dir,
-                            controller=controller, on_item_update=on_item_update, generate_previews=not direct_disk)
+    options = options_from_values(values)
     gallery = []
-    if not direct_disk:
+    def receive_image(image, name):
+        if not direct_disk:
+            preview = image.copy()
+            preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+            gallery.append((preview, name + " (not saved)"))
+    result = upscale_images(paths, options, progress, output_dir=output_dir,
+                            controller=controller, on_item_update=on_item_update, generate_previews=not direct_disk, on_image=receive_image)
+    if not direct_disk and options.output_format != NO_SAVE:
         for item in result.successes:
             preview = take_image_preview(item.output_path)
             if preview is not None:
                 gallery.append((preview, Path(item.output_path).name))
     archive_path = None
-    if not direct_disk and not result.cancelled:
+    if not direct_disk and not result.cancelled and options.output_format != NO_SAVE:
         archive_path = create_media_archive(
             (item.output_path for item in result.successes),
             output_dir,
@@ -100,7 +108,7 @@ def build_image_tab(settings):
                     c["height"] = gr.Number(value=opts.height, minimum=1, maximum=16384, precision=0, label="Output height")
                 c["aspect_lock"] = gr.Checkbox(value=opts.aspect_lock, label="Lock aspect ratio", info="Custom width determines height for each image.")
                 dimensions = gr.Markdown(visible=False, elem_id="upscale-image-dimensions")
-            c["output_format"] = gr.Dropdown(IMAGE_FORMATS, value=opts.output_format, label="Output format")
+            c["output_format"] = gr.Dropdown(IMAGE_FORMATS, value=opts.output_format, label="Output format", info="Do not save returns previews only. PNG remains the default.")
             c["quality"] = gr.Slider(1, 100, value=opts.quality, step=1, precision=0, label="Image quality", info="Used for JPEG, WebP, and AVIF.")
             c["preserve_metadata"] = gr.Checkbox(value=opts.preserve_metadata, label="Preserve metadata")
             with gr.Row():
@@ -127,7 +135,8 @@ def build_image_tab(settings):
                           zip_download=zip_download, status=status, results=results,
                           controls=c, settings_inputs=[c[n] for n in SETTING_FIELDS])
     tab.render_inputs = [sources, *tab.settings_inputs]
-    bind_batch_ui(tab, render_image_batch, kind="image", preview_mode=preview_input_images)
+    bind_batch_ui(tab, render_image_batch, kind="image", preview_mode=preview_input_images,
+                  saves_output=lambda values: values[1 + SETTING_FIELDS.index("output_format")] != NO_SAVE)
     c["rename_mode"].change(lambda mode: gr.update(interactive=mode == "Custom"), inputs=c["rename_mode"], outputs=c["custom_suffix"], queue=False)
 
     def sizing_controls(mode, lock):

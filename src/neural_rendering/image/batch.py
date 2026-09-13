@@ -10,10 +10,12 @@ from typing import Callable, Iterable
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from ...core.batch_progress import BatchItemUpdate, BatchProgress
 from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.gpu_selection import resolve_runtime_ai_gpu
+from ...core.iterations import validate_iterations
 from ...core.jobs import Cancelled, JobController, active_job
 from ...core.render_metadata import prepare_render_note
 from ...core.naming import output_filename, validate_rename
@@ -24,11 +26,18 @@ from ...core.runtime import (
 )
 from .decoder import decode_image
 from .encoder import _encode_image, take_image_preview
-from .models import IMAGE_EXTENSIONS, IMAGE_FORMATS, ImageBatchResult, ImageConversionFailure, ImageConversionOptions, ImageConversionResult
+from .models import NO_SAVE, IMAGE_EXTENSIONS, IMAGE_FORMATS, ImageBatchResult, ImageConversionFailure, ImageConversionOptions, ImageConversionResult
 from .reports import _build_manifest_and_zip, _report_data, _write_report
 
 
 def _validate_options(options: ImageConversionOptions) -> ImageConversionOptions:
+    options.iterations = validate_iterations(options.iterations)
+    if options.target_width is not None or options.target_height is not None:
+        sizes = (options.target_width, options.target_height)
+        if any(isinstance(n, bool) or not isinstance(n, int) or n < 64 for n in sizes):
+            raise ValueError("DLSS target width and height must both be integers of at least 64 pixels.")
+        if max(sizes) > 7680 or min(sizes) > 4320:
+            raise ValueError("DLSS targets support a longest side up to 7680 and a shortest side up to 4320 pixels.")
     if options.output_format not in IMAGE_FORMATS:
         raise ValueError(f"Unknown image output format: {options.output_format!r}.")
     if isinstance(options.quality, bool):
@@ -61,9 +70,13 @@ def convert_images(
     controller: JobController | None = None,
     on_item_update: Callable[[BatchItemUpdate], None] | None = None,
     generate_previews: bool = True, create_zip: bool = True,
+    on_image: Callable[[Image.Image, str], None] | None = None,
 ) -> ImageBatchResult:
     options = _validate_options(replace(options) if options else ImageConversionOptions())
-    paths = [Path(path).resolve() for path in input_paths]
+    inputs = list(input_paths)
+    paths = [Path(f"memory-image-{i + 1}.png") if isinstance(path, Image.Image) else Path(path).resolve()
+             for i, path in enumerate(inputs)]
+    save_output = options.output_format != NO_SAVE
     if not paths:
         raise ValueError("Choose at least one image.")
     controller = controller or JobController()
@@ -72,7 +85,7 @@ def convert_images(
     session = None
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
     try:
-        destination = prepare_output_dir(output_dir, default=OUTPUTS)
+        destination = prepare_output_dir(output_dir, default=OUTPUTS) if save_output else None
         LOGS.mkdir(exist_ok=True)
         with active_job(controller), ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlss5-image-decode") as decoder:
             if controller.cancel.is_set():
@@ -90,11 +103,12 @@ def convert_images(
                         break
                     reporter.advance(index, 0.0, "Decoding image")
                     output_file = None
-                    output = _output_path(path, options.output_format, stamp, index,
-                                          options.rename_mode, options.custom_suffix, output_dir=destination)
-                    decoded = processed = render_rgba = None
+                    output = (_output_path(path, options.output_format, stamp, index,
+                                           options.rename_mode, options.custom_suffix, output_dir=destination)
+                              if save_output else None)
+                    decoded = processed = render_rgba = current_rgba = alpha = None
                     try:
-                        future = next_decode or decoder.submit(decode_image, path)
+                        future = next_decode or decoder.submit(decode_image, inputs[index])
                         next_decode = None
                         while True:
                             if controller.cancel.is_set():
@@ -108,35 +122,86 @@ def convert_images(
                         del future
                         # Only one future image may be decoded ahead of the active file.
                         if index + 1 < len(paths):
-                            next_decode = decoder.submit(decode_image, paths[index + 1])
+                            next_decode = decoder.submit(decode_image, inputs[index + 1])
                         height, width = decoded.rgba.shape[:2]
                         if width < 64 or height < 64:
-                            raise ValueError(f"{path.name} is {width}×{height}; DLSS requires at least 64×64.")
-                        output_width, output_height = resolve_output_size(width, height, options.upscaling_factor)
-                        output_file = OutputFile(output)
+                            raise ValueError(f"{path.name} is {width}Ã—{height}; DLSS requires at least 64Ã—64.")
+                        output_width, output_height = (
+                            (options.target_width, options.target_height) if options.target_width is not None
+                            else resolve_output_size(width, height, options.upscaling_factor)
+                        )
+                        output_file = OutputFile(output) if save_output else None
                         dimensions = (output_width, output_height)
-                        if session is not None and dimensions != session_size:
-                            session.close()
-                            session = None
-                        if session is None:
-                            reporter.advance(index, .1, "Starting DLSS")
-                            session = DLSSFrameSession(
-                                input_width=width, input_height=height,
-                                output_width=output_width, output_height=output_height,
-                                frame_count=None, warmup_frames=options.warmup_frames,
-                                factor=factor, mode=mode, native_settings=native, gpu=gpu,
-                                runtime_bundle=prepared.runtime_bundle, controller=controller,
-                            )
-                            session_size, sent = dimensions, 0
-                            motion = np.zeros((session.render_height, session.render_width, 2), dtype=np.float16)
-                        reporter.advance(index, .25, "Processing image")
-                        render_rgba = resize_fit(decoded.rgba, session.render_width, session.render_height)
-                        processed, _pts = session.process(index=sent, rgba=render_rgba, motion=motion, reset=True, pts=sent)
-                        sent += 1
-                        evidence = verify_feature_18(session.worker_logs, session.reshade_log_text())
                         alpha = (decoded.alpha if decoded.alpha.shape == dimensions[::-1] else
                                  cv2.resize(decoded.alpha, dimensions, interpolation=cv2.INTER_LANCZOS4))
-                        processed[..., 3] = alpha
+                        current_rgba = decoded.rgba
+                        iteration_reports = []
+                        for iteration in range(options.iterations):
+                            if controller.cancel.is_set():
+                                raise Cancelled("Image rendering stopped by user.")
+                            pass_factor, pass_mode = (factor, mode) if iteration == 0 else resolve_upscaling_mode(1.0)
+                            pass_height, pass_width = current_rgba.shape[:2]
+                            # A native-resolution enhancement needs a different session from upscaling.
+                            session_key = (pass_width, pass_height, output_width, output_height, pass_factor)
+                            label = f"Iteration {iteration + 1}/{options.iterations}"
+                            fraction = .1 + .65 * iteration / options.iterations
+                            if session is not None and session_key != session_size:
+                                session.close()
+                                session = None
+                            if session is None:
+                                reporter.advance(index, fraction, f"{label}: starting DLSS")
+                                session = DLSSFrameSession(
+                                    input_width=pass_width, input_height=pass_height,
+                                    output_width=output_width, output_height=output_height,
+                                    frame_count=None, warmup_frames=options.warmup_frames,
+                                    factor=pass_factor, mode=pass_mode, native_settings=native, gpu=gpu,
+                                    runtime_bundle=prepared.runtime_bundle, controller=controller,
+                                )
+                                session_size, sent = session_key, 0
+                                motion = np.zeros((session.render_height, session.render_width, 2), dtype=np.float16)
+                            action = "upscaling and enhancing" if iteration == 0 and factor != 1.0 else "enhancing"
+                            reporter.advance(index, fraction, f"{label}: {action}")
+                            # Exact-size API callers already choose crop or stretch; do not add letterboxing.
+                            render_rgba = (
+                                cv2.resize(current_rgba, (session.render_width, session.render_height),
+                                           interpolation=cv2.INTER_LANCZOS4)
+                                if options.target_width is not None
+                                else resize_fit(current_rgba, session.render_width, session.render_height)
+                            )
+                            processed, _pts = session.process(index=sent, rgba=render_rgba, motion=motion, reset=True, pts=sent)
+                            sent += 1
+                            evidence = verify_feature_18(session.worker_logs, session.reshade_log_text())
+                            processed[..., 3] = alpha
+                            iteration_reports.append({
+                                "iteration": iteration + 1,
+                                "input_dimensions": {"width": pass_width, "height": pass_height},
+                                "render_dimensions": {"width": session.render_width, "height": session.render_height},
+                                "output_dimensions": {"width": output_width, "height": output_height},
+                                "upscaling_factor": pass_factor, "dlss_mode": pass_mode["name"],
+                                "feature_18_confirmed": True, "history_reset": True,
+                                "dlssnr_evidence": evidence["evidence"],
+                            })
+                            # Feed pixels directly into the next pass; encoding happens only after the loop.
+                            current_rgba = processed
+                            render_rgba = None
+                            reporter.advance(index, .1 + .65 * (iteration + 1) / options.iterations, f"{label}: complete")
+                        if controller.cancel.is_set():
+                            raise Cancelled("Image rendering stopped by user.")
+                        if not save_output:
+                            if on_image is not None:
+                                with Image.fromarray(processed) as rendered:
+                                    on_image(rendered, path.name)
+                            if controller.cancel.is_set():
+                                raise Cancelled("Image rendering stopped by user.")
+                            result = ImageConversionResult(
+                                str(path), "", "", reporter.elapsed(index), str(gpu["display_name"]),
+                                width, height, session.render_width, session.render_height, output_width, output_height,
+                                float(options.upscaling_factor), str(session.mode["name"]), options.output_format,
+                                options.dlss_model_preset, session.applied_dlss_model_preset, list(decoded.warnings),
+                            )
+                            successes.append(result)
+                            reporter.complete(index, "", "Not saved; neural rendering verified.")
+                            continue
                         reporter.advance(index, .8, "Saving image")
                         metadata_diagnostics = {}
                         render_note = prepare_render_note(options, session.applied_dlss_model_preset,
@@ -159,7 +224,7 @@ def convert_images(
                             options.dlss_model_preset, session.applied_dlss_model_preset, [*decoded.warnings, *warnings],
                         )
                         result.report_path = _write_report(result, options, _report_data(decoded), gpu, session, evidence,
-                                                          metadata_diagnostics=metadata_diagnostics)
+                                                          metadata_diagnostics=metadata_diagnostics, iteration_reports=iteration_reports)
                         if controller.cancel.is_set():
                             raise Cancelled("Image rendering stopped by user.")
                         output_file.publish()
@@ -169,7 +234,7 @@ def convert_images(
                         cancelled = isinstance(exc, Cancelled) or controller.cancel.is_set()
                         if output_file is not None:
                             output_file.cleanup(rollback=True)
-                        preview = take_image_preview(output)
+                        preview = take_image_preview(output) if save_output else None
                         if preview is not None:
                             preview.close()
                         if session is not None:
@@ -191,7 +256,7 @@ def convert_images(
                     finally:
                         if output_file is not None:
                             output_file.cleanup()
-                        decoded = processed = render_rgba = None
+                        decoded = processed = render_rgba = current_rgba = alpha = None
                 if session is not None and not session.closed:
                     if controller.cancel.is_set():
                         session.abort()
@@ -208,6 +273,9 @@ def convert_images(
                 if item.state == "Queued":
                     failures.append(ImageConversionFailure(item.input_path, "Cancelled before rendering."))
             reporter.skip_from(0)
+        if not save_output:
+            reporter.finish(cancelled=cancelled)
+            return ImageBatchResult(successes, failures, cancelled, "", None)
         manifest, zip_path = _build_manifest_and_zip(
             stamp, options, successes, failures, cancelled, create_zip=create_zip and not cancelled,
             output_dir=destination, batch_diagnostics=reporter.diagnostics(final=True),

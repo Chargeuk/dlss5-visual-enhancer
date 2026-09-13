@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ..core.ffmpeg import CODEC_CHOICES as FFMPEG_CODEC_CHOICES, ENCODING_QUALITIES, HDR_ALLOWED_CODECS, hdr_mode_supported
+from ..core.iterations import validate_iterations
 from ..core.naming import validate_rename
 from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
@@ -13,7 +14,7 @@ from ..upscale.image.models import options_from_settings as image_upscale_option
 QUALITY_CHOICES = ENCODING_QUALITIES
 CODEC_CHOICES = FFMPEG_CODEC_CHOICES
 CONTAINER_CHOICES = ("MP4", "MKV", "MOV")
-IMAGE_FORMAT_CHOICES = ("PNG", "JPEG", "WebP", "AVIF", "TIFF")
+IMAGE_FORMAT_CHOICES = ("PNG", "JPEG", "WebP", "AVIF", "TIFF", "Do not save")
 CONFIG_SECTION = "Settings"
 PRESET_FORMAT = "dlss5-visual-enhancer-settings-preset"
 PRESET_SCHEMA_VERSION = 1
@@ -55,6 +56,7 @@ class UISettings:
     hdr_mode: bool = False
     image_format: str = "PNG"
     image_quality: int = 95
+    image_iterations: int = 1
     nr_preset: str = "Default"
     automatic_mask: bool = False
     image_rename_mode: str = "Auto"
@@ -125,6 +127,7 @@ DEFAULT_SETTINGS = UISettings()
 
 
 def _validate(settings: UISettings) -> UISettings:
+    validate_iterations(settings.image_iterations)
     options_from_settings(settings).validate(for_render=False)
     image_upscale_options(settings).validate(for_render=False)
     for label, value in (

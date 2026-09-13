@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-IMAGE_FORMATS = ("PNG", "JPEG", "WebP", "AVIF", "TIFF")
+NO_SAVE = "Do not save"
+IMAGE_FORMATS = ("PNG", "JPEG", "WebP", "AVIF", "TIFF", NO_SAVE)
 IMAGE_EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp", "AVIF": ".avif", "TIFF": ".tiff"}
 RAW_EXTENSIONS = {
     ".3fr", ".arw", ".bay", ".cap", ".cr2", ".cr3", ".dcr", ".dcs", ".dng",
@@ -30,6 +31,10 @@ class ImageConversionOptions:
     rename_mode: str = "Auto"
     custom_suffix: str = "_DLSS5"
     dlss_model_preset: str = "Default"
+
+    iterations: int = 1
+    target_width: int | None = None
+    target_height: int | None = None
 
     def neural_options(self) -> "ImageConversionOptions":
         # Image already carries every shared neural-rendering field needed by core.runtime.

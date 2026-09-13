@@ -76,8 +76,8 @@ def initialize_image_runtime() -> None:
     _srgb_profile_bytes()
 
 def decode_image(path: str | os.PathLike[str]) -> _DecodedImage:
-    source = Path(path).resolve()
-    image, decoder = _open_pillow_source(source)
+    source = Path("memory-image.png") if isinstance(path, Image.Image) else Path(path).resolve()
+    image, decoder = (path.copy(), "Pillow memory") if isinstance(path, Image.Image) else _open_pillow_source(source)
     opened_image = image
     warnings: list[str] = []
     try:

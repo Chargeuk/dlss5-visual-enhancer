@@ -18,7 +18,7 @@ from ...settings.storage import processing_gpu_settings
 from .decoder import decode_image
 from .encoder import take_image_preview
 from .batch import convert_images
-from .models import IMAGE_FORMATS, RAW_EXTENSIONS, ImageConversionOptions
+from .models import NO_SAVE, IMAGE_FORMATS, RAW_EXTENSIONS, ImageConversionOptions
 
 
 def rename_suffix_update(mode: str):
@@ -118,6 +118,7 @@ def render_image_batch(
     image_quality: float,
     rename_mode: str,
     custom_suffix: str,
+    iterations: int = 1,
     progress=gr.Progress(track_tqdm=False),
     *, output_dir=None, controller=None, on_item_update=None, direct_disk=False,
 ):
@@ -138,6 +139,7 @@ def render_image_batch(
         upscaling_factor=upscaling_factor,
         output_format=image_format,
         quality=int(image_quality),
+        iterations=iterations,
         rename_mode=rename_mode,
         custom_suffix=custom_suffix,
     )
@@ -145,18 +147,24 @@ def render_image_batch(
     def report(value: float, message: str) -> None:
         progress(value, desc=message)
 
+    gallery = []
+    def receive_image(image, name):
+        if not direct_disk:
+            preview = image.copy()
+            preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+            gallery.append((preview, name + " (not saved)"))
+
     try:
         result = convert_images(input_paths, options, progress=report, output_dir=output_dir,
                                 controller=controller, on_item_update=on_item_update,
-                                generate_previews=not direct_disk, create_zip=not direct_disk)
+                                generate_previews=not direct_disk, create_zip=not direct_disk, on_image=receive_image)
     except Exception as exc:
         traceback.print_exc()
         if on_item_update is not None:
             raise
         return [], None, [], f"Failed: {exc}"
 
-    gallery = []
-    for item in ([] if direct_disk else result.successes):
+    for item in ([] if direct_disk or image_format == NO_SAVE else result.successes):
         preview = take_image_preview(item.output_path)
         if preview is None:
             with Image.open(item.output_path) as output:
@@ -165,7 +173,7 @@ def render_image_batch(
                 preview = preview.copy()
         gallery.append((preview, Path(item.output_path).name))
     rows = [
-        [Path(item.input_path).name, "Complete", Path(item.output_path).name, "; ".join(item.warnings)]
+        [Path(item.input_path).name, "Complete", (Path(item.output_path).name if item.output_path else "Not saved"), "; ".join(item.warnings)]
         for item in result.successes
     ]
     rows.extend(
@@ -173,8 +181,9 @@ def render_image_batch(
     )
     state = "Cancelled" if result.cancelled else "Complete"
     status = (
-        f"{state}: {len(result.successes)} image(s) rendered, {len(result.failures)} failed. "
-        "Every successful output returned feature-18 success and has a diagnostic report."
+        f"{state}: {len(result.successes)} image(s) rendered, {len(result.failures)} failed. " +
+        ("No output files were saved." if image_format == NO_SAVE else
+         "Every successful output returned feature-18 success and has a diagnostic report.")
     )
     if result.failures:
         status += f"\nFirst error: {result.failures[0].error}"
@@ -203,14 +212,15 @@ class ImageTab:
     input_path: object = None
     output_path: object = None
     job_state: object = None
+    iterations: object = None
 
     @property
     def render_inputs(self) -> list[object]:
-        return [self.sources, *self.neural, self.model_preset, self.output_format, self.quality, self.rename_mode, self.custom_suffix]
+        return [self.sources, *self.neural, self.model_preset, self.output_format, self.quality, self.rename_mode, self.custom_suffix, self.iterations]
 
     @property
     def settings_inputs(self) -> list[object]:
-        return [*self.neural, self.model_preset, self.output_format, self.quality, self.rename_mode, self.custom_suffix]
+        return [*self.neural, self.model_preset, self.output_format, self.quality, self.rename_mode, self.custom_suffix, self.iterations]
 
 
 def build_image_tab(settings: UISettings) -> ImageTab:
@@ -237,12 +247,17 @@ def build_image_tab(settings: UISettings) -> ImageTab:
             input_path, output_path = build_path_controls()
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):
                 neural = build_neural_controls(settings)
+                iterations = gr.Number(
+                    value=settings.image_iterations, minimum=1, step=1, precision=0,
+                    label="Iterations", elem_id="image-iterations",
+                    info="Total passes. Only the first pass upscales; later passes enhance the previous result at the same size. Only the final image is saved. 1 = a single pass.",
+                )
             with gr.Accordion("DLSS 5 Settings", open=True):
                 model_preset = build_dlss_model_control(settings)
             with gr.Row():
                 output_format = gr.Dropdown(
                     list(IMAGE_FORMATS), value=settings.image_format, label="Output format",
-                    info="PNG and TIFF are lossless; JPEG composites transparency over white.",
+                    info="Do not save returns previews only. PNG (default) and TIFF are lossless; JPEG composites transparency over white.",
                 )
                 quality = gr.Slider(
                     1, 100, value=settings.image_quality, step=1, precision=0,
@@ -278,13 +293,15 @@ def build_image_tab(settings: UISettings) -> ImageTab:
         sources, input_gallery, input_actions, select_source, clear_source, neural, model_preset, output_format, quality, rename_mode,
         custom_suffix, render, stop, reset, output_gallery, zip_download, status, results
     )
+    tab.iterations = iterations
     tab.input_path, tab.output_path = input_path, output_path
     bind_image_events(tab)
     return tab
 
 
 def bind_image_events(tab: ImageTab) -> None:
-    bind_batch_ui(tab, render_image_batch, kind="image", preview_mode=preview_input_images)
+    bind_batch_ui(tab, render_image_batch, kind="image", preview_mode=preview_input_images,
+                  saves_output=lambda values: values[10] != NO_SAVE)
     tab.rename_mode.change(
         rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False,
     )

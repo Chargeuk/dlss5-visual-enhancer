@@ -118,7 +118,7 @@ def release_view(key):
         view.job.controller.stop()
 
 
-def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=()):
+def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(), saves_output=None):
     """Media values are only returned in upload mode, once a batch is finished."""
     tab.job_state = gr.State(value=lambda: uuid.uuid4().hex, delete_callback=release_view)
     is_image = kind == "image"
@@ -233,7 +233,8 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
         try:
             # Resolve once. Direct paths never become a gr.File/gr.Video/Gallery value.
             paths = resolve_inputs(input_path, args[0], kind)
-            destination = str(prepare_output_dir(output_path, user_input=True))
+            destination = (str(prepare_output_dir(output_path, user_input=True))
+                           if saves_output is None or saves_output(args) else "")
             job.progress = BatchProgress(paths)
             row_values, status = job.progress.display(destination)
             yield (*empty_media(disk), row_values, status, *control_updates(True, input_path))

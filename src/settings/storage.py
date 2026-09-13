@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..core.ffmpeg import HDR_ALLOWED_CODECS
 from ..core.paths import CONFIG_PATH
+from ..core.iterations import validate_iterations
 from ..core.naming import RENAME_MODES, validate_rename
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, resolve_upscaling_mode
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
@@ -59,6 +60,12 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             return resolve_upscaling_mode(float(section.get("upscaling_factor", "1.0")))[0]
         except (TypeError, ValueError):
             return DEFAULT_SETTINGS.upscaling_factor
+
+    def image_iterations() -> int:
+        try:
+            return validate_iterations(float(section.get("image_iterations", "1")))
+        except (TypeError, ValueError, OverflowError):
+            return DEFAULT_SETTINGS.image_iterations
 
     def image_quality() -> int:
         value = number("image_quality", 1, 100, DEFAULT_SETTINGS.image_quality)
@@ -167,6 +174,7 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format
         ),
         image_quality=image_quality(),
+        image_iterations=image_iterations(),
         dlss_model_preset=choice(
             "dlss_model_preset",
             tuple(DLSS_MODEL_PRESETS),
@@ -271,6 +279,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "hdr_mode": str(settings.hdr_mode).lower(),
         "image_format": settings.image_format,
         "image_quality": str(settings.image_quality),
+        "image_iterations": str(settings.image_iterations),
         "image_rename_mode": settings.image_rename_mode,
         "image_custom_suffix": settings.image_custom_suffix,
         "video_rename_mode": settings.video_rename_mode,
