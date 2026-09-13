@@ -119,7 +119,9 @@ def persist_image_settings(
     image_quality: float,
     rename_mode: str,
     custom_suffix: str,
+    iterations: int = 1,
 ) -> tuple:
+    from ..core.iterations import validate_iterations
     with _CONFIG_LOCK:
         current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
         settings = replace(
@@ -139,6 +141,7 @@ def persist_image_settings(
             mask_feather=int(mask_feather),
             image_format=image_format,
             image_quality=int(image_quality),
+            image_iterations=validate_iterations(iterations),
             image_rename_mode=rename_mode,
             image_custom_suffix=custom_suffix,
         )
@@ -422,6 +425,7 @@ def _settings_component_values(settings: UISettings) -> tuple:
         settings.upscale_mode,
         *(getattr(settings, "upscale_" + name) for name in SETTING_FIELDS),
         *(getattr(settings, "upscale_image_" + name) for name in IMAGE_UPSCALE_FIELDS),
+        settings.image_iterations,
     )
 
 
@@ -701,6 +705,7 @@ def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, li
         upscale_tab.mode,
         *upscale_tab.video.settings_inputs,
         *upscale_tab.image.settings_inputs,
+        image_tab.iterations,
     ]
 
 

@@ -18,25 +18,19 @@ class ImageConversionOptions:
     ai_gpu_uuid: str = "auto"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
-    nr_passes: int = 1
     local_tone_strength: float = 1.0
     local_structure_strength: float = 1.0
     skin_structure_strength: float = -1.0
-    nr_color_strength: float = 1.0
-    tone_preservation: float = 0.0
-    face_skin_protection: float = 0.0
-    grain_preservation: float = 0.0
-    mask_feather: int = 0
-    nr_mask: object | None = None
     upscaling_factor: float = 1.0
     output_format: str = "PNG"
     quality: int = 95
     preserve_metadata: bool = True
     warmup_frames: int = 0
+    nr_preset: str = "Default"
     automatic_mask: bool = False
-    nr_gpu_mode: bool = True
     rename_mode: str = "Auto"
-    custom_suffix: str = "_Neural_Rendering"
+    custom_suffix: str = "_DLSS5"
+    dlss_model_preset: str = "Default"
 
     iterations: int = 1
     target_width: int | None = None
@@ -61,13 +55,11 @@ class ImageConversionResult:
     output_width: int
     output_height: int
     upscaling_factor: float
+    dlss_mode: str
     output_format: str
-    neural_dimensions: dict[str, int] | None = None
-    resize_method: str = "none"
-    memory_path: str = "host_staging"
-    bridge_status: dict | None = None
+    dlss_model_preset: str = "Default"
+    applied_dlss_model_preset: int = 0
     warnings: list[str] = field(default_factory=list)
-    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

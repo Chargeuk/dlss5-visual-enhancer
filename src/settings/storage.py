@@ -190,6 +190,7 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format
         ),
         image_quality=image_quality(),
+        image_iterations=integer("image_iterations", 1, 2**31-1, 1),
         image_rename_mode=image_rename_mode,
         image_custom_suffix=image_custom_suffix,
         video_rename_mode=video_rename_mode,
@@ -299,6 +300,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "hdr_mode": str(settings.hdr_mode).lower(),
         "image_format": settings.image_format,
         "image_quality": str(settings.image_quality),
+        "image_iterations": str(settings.image_iterations),
         "image_rename_mode": settings.image_rename_mode,
         "image_custom_suffix": settings.image_custom_suffix,
         "video_rename_mode": settings.video_rename_mode,

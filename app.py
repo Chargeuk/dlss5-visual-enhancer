@@ -28,6 +28,9 @@ except Exception:
     _EARLY_TS = 0.0
 
 import gradio as gr
+from starlette.routing import WebSocketRoute
+from src.frame_interpolation.stream import interpolation_socket
+from src.neural_rendering.image.api import register_image_api
 
 from src.about.ui import build_about_tab
 from src.core.batch_ui import bind_input_surface_reactivation
@@ -457,6 +460,7 @@ def build_app() -> gr.Blocks:
             None, js=init_mode_js, queue=False, show_progress="hidden",
             trigger_mode="always_last",
         )
+        register_image_api()
     return demo
 
 
@@ -525,7 +529,8 @@ def main() -> None:
         demo.queue(default_concurrency_limit=1).launch(
             css=APP_CSS,
             theme=gr.themes.Ocean(),
-            server_name="127.0.0.1",
+            server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
+            app_kwargs={"routes": [WebSocketRoute("/vts/interpolate", interpolation_socket)]},
             inbrowser=True,
             share=False,
             allowed_paths=[str(OUTPUTS.resolve())],

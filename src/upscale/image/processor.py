@@ -18,7 +18,7 @@ from ...neural_rendering.image.decoder import decode_image
 from ...neural_rendering.image.encoder import (
     _encode_image, make_image_preview, save_full_size_image_preview,
 )
-from ...neural_rendering.image.models import ImageConversionOptions
+from ...neural_rendering.image.models import ImageConversionOptions, NO_SAVE
 from .models import IMAGE_EXTENSIONS, ImageUpscaleOptions, ImageUpscaleResult, output_size
 
 
@@ -81,7 +81,7 @@ def preview_upscale_image(input_path, options=None, progress=None, *, controller
             last_results = tuple(session.last_results)
 
         update(.88, "Preparing preview")
-        if full_size_preview:
+        if full_size_preview and options.output_format != NO_SAVE:
             preview = save_full_size_image_preview(
                 processed, options.output_format, decoded.alpha is not None
             )
@@ -102,17 +102,20 @@ def preview_upscale_image(input_path, options=None, progress=None, *, controller
 
 
 def upscale_image(input_path, options=None, progress=None, *, output_dir=None, controller=None,
-                  generate_previews=True, _owns_slot=False, _capabilities=None):
+                  generate_previews=True, _owns_slot=False, _capabilities=None, on_image=None):
     options = replace(options) if options else ImageUpscaleOptions()
     options.validate()
-    source = Path(input_path).resolve()
-    if not source.is_file():
+    source = input_path if isinstance(input_path, Image.Image) else Path(input_path).resolve()
+    if not isinstance(source, Image.Image) and not source.is_file():
         raise FileNotFoundError(source)
     with nullcontext(controller) if _owns_slot else active_job(controller) as controller:
-        return _process(source, options, progress, output_dir, controller, generate_previews, _capabilities)
+        return _process(source, options, progress, output_dir, controller, generate_previews, _capabilities, on_image)
 
 
-def _process(source, options, progress, output_dir, controller, generate_previews, capabilities):
+def _process(source, options, progress, output_dir, controller, generate_previews, capabilities, on_image=None):
+    image_source = source
+    source = Path("memory-image.png") if isinstance(source, Image.Image) else source
+    save_outputs = options.output_format != NO_SAVE
     started = time.monotonic()
     stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     report_path = app_log.session_path()
@@ -128,19 +131,27 @@ def _process(source, options, progress, output_dir, controller, generate_preview
 
     try:
         update(.01, "Decoding image")
-        decoded = decode_image(source)
+        decoded = decode_image(image_source)
         height, width = decoded.rgba.shape[:2]
         ow, oh = output_size(width, height, options)
         caps = capabilities or probe_capabilities(options.ai_gpu_uuid, controller=controller)
         output = prepare_output_dir(output_dir) / output_filename(
             source, IMAGE_EXTENSIONS[options.output_format], options.rename_mode, options.custom_suffix,
-            f"{source.stem}_RTXIMAGE_{stamp}")
-        destination_file = OutputFile(output)
+            f"{source.stem}_RTXIMAGE_{stamp}") if save_outputs else None
+        destination_file = OutputFile(output) if save_outputs else None
         update(.15, f"RTX VSR: {width}×{height} → {ow}×{oh}")
         with RTXVideoSession(width, height, ow, oh, options.native_options(), 1, caps, controller) as session:
             processed = worker_to_srgb(session.process_frame(srgb_to_worker(decoded.rgba)), ow, oh, decoded.alpha)
             if session.completed_frames != 1:
                 raise RuntimeError("RTX VSR did not process exactly one image.")
+        if on_image is not None:
+            with Image.fromarray(processed) as image:
+                on_image(image, source.name)
+        if controller.cancel.is_set():
+            raise Cancelled("Image processing stopped by user.")
+        if not save_outputs:
+            update(1.0, "Complete — not saved")
+            return ImageUpscaleResult(str(source), "", "", ow, oh, time.monotonic() - started, list(decoded.warnings))
         update(.80, "Saving image")
         export = ImageConversionOptions(output_format=options.output_format, quality=int(options.quality),
                                         preserve_metadata=options.preserve_metadata)

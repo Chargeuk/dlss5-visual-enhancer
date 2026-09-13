@@ -12,7 +12,7 @@ from ...core.disk_paths import resolve_inputs
 from ...core.naming import RENAME_MODES
 from ...neural_rendering.image.decoder import decode_image, full_size_image_preview_path
 from ...neural_rendering.image.encoder import take_image_preview
-from ...neural_rendering.image.models import RAW_EXTENSIONS
+from ...neural_rendering.image.models import RAW_EXTENSIONS, NO_SAVE
 from ...neural_rendering.image.ui import preview_input_images
 from ...settings.storage import full_size_image_previews_enabled, processing_gpu_settings
 from .batch import upscale_images
@@ -30,13 +30,22 @@ def options_from_values(values):
 def render_image_batch(paths, *values, progress=None, output_dir=None, controller=None,
                        on_item_update=None, direct_disk=False):
     full_size = full_size_image_previews_enabled()
+    options = options_from_values(values)
+    memory_gallery = []
+    def receive_image(image, name):
+        if not direct_disk:
+            preview = image.copy()
+            if not full_size:
+                preview.thumbnail((1200, 900), Image.Resampling.BILINEAR)
+            memory_gallery.append((preview, name))
     result = upscale_images(
-        paths, options_from_values(values), progress, output_dir=output_dir,
+        paths, options, progress, output_dir=output_dir,
         controller=controller, on_item_update=on_item_update,
         generate_previews=not direct_disk and not full_size,
+        on_image=receive_image if options.output_format == NO_SAVE else None,
     )
-    gallery = []
-    if not direct_disk:
+    gallery = memory_gallery
+    if not direct_disk and options.output_format != NO_SAVE:
         for item in result.successes:
             preview = None
             if full_size:
@@ -55,8 +64,8 @@ def render_image_batch(paths, *values, progress=None, output_dir=None, controlle
                 except Exception:
                     continue
             gallery.append((preview, Path(item.output_path).name))
-    files = [item.output_path for item in result.successes]
-    return gallery, files, [], str(result.manifest_path)
+    files = [item.output_path for item in result.successes if item.output_path]
+    return gallery, files, [], ("No output files saved." if options.output_format == NO_SAVE else str(result.manifest_path))
 
 
 def preview_image(paths, *values, progress=gr.Progress(track_tqdm=False)):

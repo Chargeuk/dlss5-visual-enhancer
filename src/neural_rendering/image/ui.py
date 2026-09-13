@@ -19,7 +19,7 @@ from .decoder import decode_image_preview, full_size_image_preview_path
 from .encoder import take_image_preview
 from .batch import convert_images
 from .preview import render_image_preview
-from .models import IMAGE_FORMATS, RAW_EXTENSIONS, ImageConversionOptions
+from .models import NO_SAVE, IMAGE_FORMATS, RAW_EXTENSIONS, ImageConversionOptions
 from ..composition_ui import CompositionWidgets, build_composition_sliders, build_composition_widgets
 
 
@@ -115,6 +115,7 @@ def _image_options(
     image_quality: float,
     rename_mode: str,
     custom_suffix: str,
+    iterations: int = 1,
 ) -> ImageConversionOptions:
     return ImageConversionOptions(
         ai_gpu_uuid=processing_gpu_settings()[0],
@@ -137,6 +138,7 @@ def _image_options(
         quality=int(image_quality),
         rename_mode=rename_mode,
         custom_suffix=custom_suffix,
+        iterations=iterations,
     )
 
 
@@ -161,6 +163,7 @@ def render_image_batch(
     image_quality: float,
     rename_mode: str,
     custom_suffix: str,
+    iterations: int = 1,
     progress=gr.Progress(track_tqdm=False),
     *, output_dir=None, controller=None, on_item_update=None, direct_disk=False,
 ):
@@ -173,9 +176,16 @@ def render_image_batch(
         skin_structure_strength, upscaling_factor, automatic_mask,
         nr_color_strength, tone_preservation, face_skin_protection, grain_preservation,
         mask_feather, nr_mask, nr_gpu_mode,
-        image_format, image_quality, rename_mode, custom_suffix,
+        image_format, image_quality, rename_mode, custom_suffix, iterations,
     )
     full_size = full_size_image_previews_enabled()
+    memory_gallery = []
+    def receive_image(image, name):
+        if not direct_disk:
+            preview = image.copy()
+            if not full_size:
+                preview.thumbnail((1200, 900), Image.Resampling.BILINEAR)
+            memory_gallery.append((preview, name))
 
     def report(value: float, message: str) -> None:
         progress(value, desc=message)
@@ -183,15 +193,16 @@ def render_image_batch(
     try:
         result = convert_images(input_paths, options, progress=report, output_dir=output_dir,
                                 controller=controller, on_item_update=on_item_update,
-                                generate_previews=not direct_disk and not full_size, create_zip=False)
+                                generate_previews=not direct_disk and not full_size, create_zip=False,
+                                on_image=receive_image if image_format == NO_SAVE else None)
     except Exception as exc:
         traceback.print_exc()
         if on_item_update is not None:
             raise
         return [], None, [], f"Failed: {exc}"
 
-    gallery = []
-    for item in ([] if direct_disk else result.successes):
+    gallery = memory_gallery
+    for item in ([] if direct_disk or image_format == NO_SAVE else result.successes):
         preview = None
         if full_size:
             try:
@@ -208,7 +219,7 @@ def render_image_batch(
                 preview = preview.copy()
         gallery.append((preview, Path(item.output_path).name))
     rows = [
-        [Path(item.input_path).name, "Complete", Path(item.output_path).name, "; ".join(item.warnings)]
+        [Path(item.input_path).name, "Complete", (Path(item.output_path).name if item.output_path else "Not saved"), "; ".join(item.warnings)]
         for item in result.successes
     ]
     rows.extend(
@@ -219,9 +230,11 @@ def render_image_batch(
         f"{state}: {len(result.successes)} image(s) rendered, {len(result.failures)} failed. "
         "Every successful output returned feature-18 success and has a diagnostic report."
     )
+    if image_format == NO_SAVE:
+        status = f"{state}: {len(result.successes)} image(s) rendered, {len(result.failures)} failed. No output files saved."
     if result.failures:
         status += f"\nFirst error: {result.failures[0].error}"
-    return gallery, [item.output_path for item in result.successes], rows, status
+    return gallery, [item.output_path for item in result.successes if item.output_path], rows, status
 
 
 def preview_rendered_image(
@@ -245,6 +258,7 @@ def preview_rendered_image(
     image_quality: float,
     rename_mode: str,
     custom_suffix: str,
+    iterations: int = 1,
     progress=gr.Progress(track_tqdm=False),
     *, output_dir=None, controller=None, ephemeral_preview=False,
 ):
@@ -257,7 +271,7 @@ def preview_rendered_image(
         skin_structure_strength, upscaling_factor, automatic_mask,
         nr_color_strength, tone_preservation, face_skin_protection, grain_preservation,
         mask_feather, nr_mask, nr_gpu_mode,
-        image_format, image_quality, rename_mode, custom_suffix,
+        image_format, image_quality, rename_mode, custom_suffix, iterations,
     )
     full_size = full_size_image_previews_enabled()
     image, status = render_image_preview(
@@ -295,13 +309,14 @@ class ImageTab:
     zip_download: object
     status: object
     results: object
+    iterations: object = None
     input_path: object = None
     output_path: object = None
     job_state: object = None
 
     @property
     def render_inputs(self) -> list[object]:
-        return [self.sources, *self.neural, self.mask_state, self.gpu_mode, self.output_format, self.quality, self.rename_mode, self.custom_suffix]
+        return [self.sources, *self.neural, self.mask_state, self.gpu_mode, self.output_format, self.quality, self.rename_mode, self.custom_suffix, self.iterations]
 
     @property
     def preview_inputs(self) -> list[object]:
@@ -309,7 +324,7 @@ class ImageTab:
 
     @property
     def settings_inputs(self) -> list[object]:
-        return [*self.neural, self.output_format, self.quality, self.rename_mode, self.custom_suffix]
+        return [*self.neural, self.output_format, self.quality, self.rename_mode, self.custom_suffix, self.iterations]
 
 
 def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: object) -> ImageTab:
@@ -341,6 +356,7 @@ def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
             with gr.Column(elem_classes=["neural-controls-unified"]):
                 neural = build_neural_controls(settings)
                 composition = build_composition_widgets()
+                iterations = gr.Number(value=settings.image_iterations, minimum=1, precision=0, label="Enhancement iterations", info="Resize once, then repeat enhancement at the same size. Each iteration uses the selected NR Passes; only the final image is saved.")
             input_path, output_path = build_path_controls()
             with gr.Row():
                 output_format = gr.Dropdown(
@@ -375,6 +391,7 @@ def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
         sources, input_gallery, input_actions, select_source, clear_source, neural, composition, mask_state, gpu_mode_state, output_format, quality, rename_mode,
         custom_suffix, render, stop, preview, reset, output_gallery, save_download, zip_button, zip_download, status, results
     )
+    tab.iterations = iterations
     tab.input_path, tab.output_path = input_path, output_path
     bind_image_events(tab)
     return tab
@@ -386,7 +403,7 @@ def bind_image_events(tab: ImageTab) -> None:
         archive_prefix="DLSS5_IMAGE_BATCH",
         preview_actions=[(tab.preview, preview_rendered_image)],
         realtime_preview=preview_rendered_image,
-        realtime_components=tab.neural,
+        realtime_components=[*tab.neural, tab.iterations],
     )
     tab.rename_mode.change(
         rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False,

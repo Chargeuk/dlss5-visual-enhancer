@@ -13,7 +13,7 @@ from ..upscale.image.models import options_from_settings as image_upscale_option
 QUALITY_CHOICES = ENCODING_QUALITIES
 CODEC_CHOICES = FFMPEG_CODEC_CHOICES
 CONTAINER_CHOICES = ("MP4", "MKV", "MOV")
-IMAGE_FORMAT_CHOICES = ("PNG", "JPEG", "WebP", "AVIF", "TIFF")
+IMAGE_FORMAT_CHOICES = ("PNG", "JPEG", "WebP", "AVIF", "TIFF", "Do not save")
 CONFIG_SECTION = "Settings"
 PRESET_FORMAT = "dlss5-visual-enhancer-settings-preset"
 PRESET_SCHEMA_VERSION = 6
@@ -67,6 +67,7 @@ class UISettings:
     hdr_mode: bool = False
     image_format: str = "PNG"
     image_quality: int = 95
+    image_iterations: int = 1
     automatic_mask: bool = False
     image_rename_mode: str = "Auto"
     image_custom_suffix: str = "_Neural_Rendering"
@@ -143,6 +144,8 @@ DEFAULT_SETTINGS = UISettings()
 
 
 def _validate(settings: UISettings) -> UISettings:
+    from ..core.iterations import validate_iterations
+    validate_iterations(settings.image_iterations)
     options_from_settings(settings).validate(for_render=False)
     image_upscale_options(settings).validate(for_render=False)
     for label, value in (

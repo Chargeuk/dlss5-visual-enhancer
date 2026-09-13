@@ -10,6 +10,8 @@ from typing import Callable, Iterable
 
 import cv2
 import numpy as np
+from PIL import Image
+from ...core.iterations import validate_iterations
 
 from ...core.batch_progress import BatchItemUpdate, BatchProgress
 from ...core.disk_paths import OutputFile, prepare_output_dir
@@ -25,7 +27,7 @@ from ...core.runtime import (
 from .decoder import _DecodedImage, decode_image
 from .encoder import _encode_image, take_image_preview
 from .models import (
-    IMAGE_EXTENSIONS, IMAGE_FORMATS, ImageBatchResult, ImageConversionFailure,
+    NO_SAVE, IMAGE_EXTENSIONS, IMAGE_FORMATS, ImageBatchResult, ImageConversionFailure,
     ImageConversionOptions, ImageConversionResult,
 )
 from .reports import (
@@ -60,6 +62,13 @@ class _OutputTask:
 
 
 def _validate_options(options: ImageConversionOptions) -> ImageConversionOptions:
+    options.iterations = validate_iterations(options.iterations)
+    if options.target_width is not None or options.target_height is not None:
+        sizes = (options.target_width, options.target_height)
+        if any(isinstance(n, bool) or not isinstance(n, int) or n < 64 for n in sizes):
+            raise ValueError("Both target dimensions must be integers of at least 64 pixels.")
+        if max(sizes) > 7680 or min(sizes) > 4320:
+            raise ValueError("Target exceeds the 7680 by 4320 boundary.")
     if options.output_format not in IMAGE_FORMATS:
         raise ValueError(f"Unknown image output format: {options.output_format!r}.")
     if isinstance(options.quality, bool):
@@ -97,12 +106,32 @@ def _finalize_output(
     controller: JobController,
     generate_previews: bool,
     archive: IncrementalImageArchive | None,
+    on_image=None,
 ) -> ImageConversionResult:
     """CPU/I/O stage. Runs on exactly one bounded output worker."""
     output_file = None
     try:
         if controller.cancel.is_set():
             raise Cancelled("Image rendering stopped by user.")
+        if on_image is not None:
+            with Image.fromarray(task.processed) as image:
+                on_image(image, task.path.name)
+        if controller.cancel.is_set():
+            raise Cancelled("Image processing stopped by user.")
+        if options.output_format == NO_SAVE:
+            result = ImageConversionResult(
+                input_path=str(task.path), output_path="", report_path="",
+                elapsed_seconds=reporter.elapsed(task.index), gpu=str(task.gpu["display_name"]),
+                input_width=task.input_width, input_height=task.input_height,
+                render_width=task.render_width, render_height=task.render_height,
+                output_width=task.output_width, output_height=task.output_height,
+                upscaling_factor=float(options.upscaling_factor), output_format=NO_SAVE,
+                neural_dimensions={"width": task.render_width, "height": task.render_height},
+                resize_method=task.resize_method, memory_path=task.memory_path,
+                bridge_status=task.bridge_status, warnings=task.source_warnings, timings=task.timings,
+            )
+            reporter.complete(task.index, "", "Not saved")
+            return result
         reporter.advance(task.index, .80, "Encoding image")
         output_file = OutputFile(task.output)
         metadata_diagnostics: dict = {}
@@ -203,10 +232,12 @@ def convert_images(
     *, output_dir: str | os.PathLike[str] | None = None,
     controller: JobController | None = None,
     on_item_update: Callable[[BatchItemUpdate], None] | None = None,
-    generate_previews: bool = True, create_zip: bool = True,
+    generate_previews: bool = True, create_zip: bool = True, on_image=None,
 ) -> ImageBatchResult:
     options = _validate_options(replace(options) if options else ImageConversionOptions())
-    paths = [Path(path).resolve() for path in input_paths]
+    sources = list(input_paths)
+    paths = [Path(f"memory-{i}.png") if isinstance(p, Image.Image) else Path(p).resolve() for i, p in enumerate(sources)]
+    save_outputs = options.output_format != NO_SAVE
     if not paths:
         raise ValueError("Choose at least one image.")
     controller = controller or JobController()
@@ -238,8 +269,8 @@ def convert_images(
             successes.append(result)
 
     try:
-        destination = prepare_output_dir(output_dir, default=OUTPUTS)
-        if create_zip:
+        destination = prepare_output_dir(output_dir, default=OUTPUTS) if save_outputs else None
+        if create_zip and save_outputs:
             archive = IncrementalImageArchive(
                 destination / f"DLSS5_IMAGE_BATCH_{stamp}.zip", controller,
             )
@@ -266,13 +297,13 @@ def convert_images(
                     output = _output_path(
                         path, options.output_format, stamp, index,
                         options.rename_mode, options.custom_suffix, output_dir=destination,
-                    )
+                    ) if save_outputs else Path(f"memory-result-{index}.png")
                     decoded = None
                     render_rgba = None
                     processed = None
                     timings: dict[str, float] = {}
                     try:
-                        future = next_decode or decoder.submit(_timed_decode, path)
+                        future = next_decode or decoder.submit(_timed_decode, sources[index])
                         next_decode = None
                         while True:
                             if controller.cancel.is_set():
@@ -286,7 +317,7 @@ def convert_images(
                         del future
                         # Decode only one future image ahead to keep memory bounded.
                         if index + 1 < len(paths):
-                            next_decode = decoder.submit(_timed_decode, paths[index + 1])
+                            next_decode = decoder.submit(_timed_decode, sources[index + 1])
 
                         height, width = decoded.rgba.shape[:2]
                         if width < 64 or height < 64:
@@ -296,6 +327,8 @@ def convert_images(
                         output_width, output_height = resolve_output_size(
                             width, height, options.upscaling_factor,
                         )
+                        if options.target_width is not None:
+                            output_width, output_height = options.target_width, options.target_height
                         dimensions = (output_width, output_height)
                         if session is not None and dimensions != session_size:
                             close_started = time.monotonic()
@@ -339,6 +372,13 @@ def convert_images(
                         )
                         timings["dlss_evaluate"] = time.monotonic() - dlss_started
                         sent += 1
+                        for iteration in range(1, options.iterations):
+                            if controller.cancel.is_set():
+                                raise Cancelled("Image rendering stopped by user.")
+                            reporter.advance(index, .25 + .5 * iteration / options.iterations,
+                                             f"Enhancement iteration {iteration + 1}/{options.iterations}")
+                            processed, _pts = session.process(index=sent, rgba=processed, reset=True, pts=sent)
+                            sent += 1
 
                         if session_evidence is None:
                             evidence_started = time.monotonic()
@@ -415,7 +455,7 @@ def convert_images(
                             path,
                             output_worker.submit(
                                 _finalize_output, task, options, reporter, controller,
-                                generate_previews, archive,
+                                generate_previews, archive, on_image,
                             ),
                         )
                         # Ownership of the full output moves to the worker.
@@ -480,7 +520,7 @@ def convert_images(
             output_dir=destination,
             batch_diagnostics=reporter.diagnostics(final=True),
             archive_error=archive_error,
-        )
+        ) if save_outputs else ""
         reporter.finish(cancelled=cancelled, manifest_path=manifest)
         return ImageBatchResult(successes, failures, cancelled, manifest, zip_path)
     except BaseException as exc:

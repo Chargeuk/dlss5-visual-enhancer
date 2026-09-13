@@ -1,0 +1,2 @@
+# Extra dependency for the VTS WebSocket endpoint, on top of the v7 portable runtime.
+websockets>=15.0.1

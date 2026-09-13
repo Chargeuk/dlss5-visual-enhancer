@@ -10,10 +10,11 @@ from ...core.jobs import Cancelled, JobController, active_job
 from ..video.native import probe_capabilities
 from .models import ImageUpscaleOptions, ImageUpscaleBatchResult, ImageUpscaleFailure
 from .processor import upscale_image
+from ...neural_rendering.image.models import NO_SAVE
 
 
 def upscale_images(input_paths, options=None, progress=None, *, output_dir=None, controller=None,
-                   on_item_update=None, generate_previews=True):
+                   on_item_update=None, generate_previews=True, on_image=None):
     options = replace(options) if options else ImageUpscaleOptions()
     options.validate()
     paths = [Path(p).resolve() for p in input_paths]
@@ -23,7 +24,7 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
     reporter = BatchProgress(paths, on_item_update, progress)
     successes, failures = [], []
     try:
-        destination = prepare_output_dir(output_dir)
+        destination = prepare_output_dir(output_dir) if options.output_format != NO_SAVE else None
         with active_job(controller):
             if controller.cancel.is_set():
                 raise Cancelled("Stopped before rendering.")
@@ -35,7 +36,7 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
                 try:
                     result = upscale_image(path, options, lambda v, m, i=i: reporter.advance(i, v, m),
                                            output_dir=destination, controller=controller, _owns_slot=True,
-                                           _capabilities=caps, generate_previews=generate_previews)
+                                           _capabilities=caps, generate_previews=generate_previews, on_image=on_image)
                 except Exception as exc:
                     cancelled = controller.cancel.is_set() or isinstance(exc, Cancelled)
                     failures.append(ImageUpscaleFailure(i, str(path), str(exc), cancelled))

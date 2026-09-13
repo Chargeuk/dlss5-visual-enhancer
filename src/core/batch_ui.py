@@ -521,7 +521,7 @@ def bind_batch_ui(
         try:
             # Resolve once. Direct paths never become a gr.File/gr.Video/Gallery value.
             paths = resolve_inputs(input_path, args[0], kind)
-            destination = str(prepare_output_dir(output_path, user_input=True))
+            destination = "" if kind == "image" and "Do not save" in args else str(prepare_output_dir(output_path, user_input=True))
             job.progress = BatchProgress(paths)
             row_values, status = job.progress.display(destination)
             yield (*empty_media(disk), row_values, status, *control_updates(True, input_path))

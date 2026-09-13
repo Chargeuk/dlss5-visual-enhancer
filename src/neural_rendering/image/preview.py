@@ -97,6 +97,10 @@ def render_image_preview(
                 index=0, rgba=render_rgba, reset=True, pts=0,
             )
 
+            for iteration in range(1, options.iterations):
+                _update(controller, progress, .3 + .4 * iteration / options.iterations, f"Enhancement iteration {iteration + 1}/{options.iterations}")
+                processed, _pts = session.process(index=iteration, rgba=processed, reset=True, pts=iteration)
+
             _update(controller, progress, .72, "Verifying feature 18")
             verify_feature_18(session.bridge_logs, session.structured_status())
 
@@ -122,7 +126,7 @@ def render_image_preview(
             session = None
 
             _update(controller, progress, .94, "Preparing preview")
-            if full_size_preview:
+            if full_size_preview and options.output_format != "Do not save":
                 preview = save_full_size_image_preview(
                     processed, options.output_format, decoded.alpha is not None,
                 )
