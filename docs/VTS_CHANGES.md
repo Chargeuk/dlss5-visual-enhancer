@@ -1,97 +1,72 @@
-# VTS integration and upstream merge
+# VTS integration
 
-`main` includes upstream commit `6000792913460fffc002731b5b750a1d14114859`
-(v8-era Neuroframe backend) plus the Chargeuk VTS integrations. The tested v7
-installation is preserved separately on branch `vts-merserk-v7`.
+This fork uses the current upstream Neuroframe, RTX VSR and DLSS Frame Generation
+engines. The VTS layer supplies image APIs, interpolation streaming, enhancement
+iterations and optional no-save output. No v7 compatibility runtime is required.
 
-## Features retained
+## Image processing
 
-- Upstream Neuroframe rendering, native NR Passes, composition/mask controls,
-  GPU/RAM paths, temporal stabilization, Live/video features, and overlapped
-  image decoding, rendering and output handling remain intact.
-- Image enhancement iterations feed each result into the next iteration. Resize
-  happens once; only the final image is saved. Iterations persist through settings
-  and presets. Each iteration uses the selected upstream NR Passes (1-4), so the
-  total neural evaluations are `iterations * nr_passes`.
-- Neural and RTX VSR image GUIs offer **Do not save**, while defaulting to PNG.
-  No-save returns previews without publishing production images/manifests/ZIPs.
-  Browser previews may still use Gradio's own cache. VTS memory APIs bypass that
-  image cache and return lossless PNG directly.
-- `/vts_enhance`, `/vts_enhance_memory`, `/vts_cancel` retain their existing
-  arguments and return types. Cancellation targets the identified request.
-- `/vts/interpolate` retains lossless chunked PNG transport, persistent GPU
-  sessions, generated-frame-only responses, scene-cut handling and bounded
-  buffers. Cleanup is shielded from ASGI cancellation before releasing the GPU.
-  See [interpolation protocol and node usage](VTS_INTERPOLATION.md).
+The VTS node calculates dimensions with its existing shared Scale To Min helper,
+including reversed limits, divisibility and optional centre cropping. It performs
+Lanczos reduction locally, including shrinking only the necessary axis for a
+mixed-aspect resize. This keeps uploads small.
 
-## Renderer selection and compatibility
+The server receives one PNG per source image. It uses RTX VSR once if enlargement
+is needed, then feeds that result through Neuroframe enhancement iterations at the
+final dimensions. Native `nr_passes` (1-4) applies within each iteration:
+`iterations=3, nr_passes=2` means six neural evaluations. There is one final PNG
+response, with no intermediate image files or repeated network transfers.
 
-Image API JSON accepts optional `backend`: `auto` (default), `neuroframe`, `legacy`.
+Both scaling and neural enhancement can be independently disabled by the VTS node.
+Scaling-only requests use RTX VSR for enlargement; purely local reductions and
+bypass need no server. The input/output socket accepts IMAGE or VTS DiskImage;
+DiskImage writes only final results on the ComfyUI client.
 
-- **Auto:** uses Neuroframe for compatible native-size/downscale enhancement.
-  Requests for upscaling, non-default `nr_preset`, or non-default
-  `dlss_model_preset` use the isolated v7 worker, preserving the existing VTS
-  node's DLSS scaling and preset semantics. Explicit larger target dimensions
-  also select this compatibility path. There is no silent substitution of
-  Lanczos or RTX VSR for an old DLSS SR request.
-- **Neuroframe:** exposes new `nr_passes`, `nr_color_strength`,
-  `tone_preservation`, `face_skin_protection`, `grain_preservation`,
-  `mask_feather`, and `nr_gpu_mode` in addition to existing compatible controls.
-  Legacy-only scaling/preset requests produce a clear error in this mode.
-- **Legacy:** uses `src/legacy/`, isolated from upstream renderer code and runtime
-  directories. New Neuroframe-only controls are rejected, not silently ignored.
-- **`operation=vsr`:** continues to use the upstream RTX Video Super Resolution
-  image implementation with explicit target dimensions and no output-file save.
+## API
 
-The compatibility backend is retained source from upstream v7 plus our tested
-customizations, with adapters for the current decoder and shared job management.
-It exists because upstream removed DLSS SR and the older preset controls from
-its replacement neural renderer. Selecting a different backend can change image
-appearance; the APIs preserve settings rather than promising identical output
-across different renderers.
+`/vts_enhance_memory`, `/vts_enhance` and `/vts_cancel` retain their transport
+signatures and request-specific cancellation. The file endpoint uses Gradio's
+cache; the memory endpoint accepts and returns base64 PNG directly without image
+cache or output files. Runtime diagnostic logging remains enabled.
 
-## Running a source checkout
+Image JSON accepts `operation` (`neural` or `vsr`), `target_width`, `target_height`
+and `vsr_quality` (1-4). The neural operation also accepts `iterations`, `nr_passes`,
+`nr_style`, `nr_intensity`, `local_tone_strength`, `local_structure_strength`,
+`skin_structure_strength`, `automatic_mask`, `nr_color_strength`,
+`tone_preservation`, `face_skin_protection`, `grain_preservation` and `nr_gpu_mode`.
+Old DLSS presets, scaling-performance presets and renderer-selection fields are
+not part of this interface. Custom-mask upload is outside this initial API.
 
-1. Obtain the [upstream v8.0 portable release](https://github.com/Merserk/dlss5-visual-enhancer/releases/tag/v8.0)
-   and copy its `bin/` directory into this checkout. Keep the source from this
-   branch; do not overwrite it with release source.
-2. Install the streaming dependency using the portable Python:
+Neural targets must be at least 64 pixels per side, at most 7680 on the longest
+side and 4320 on the shortest. RTX VSR is limited to 16384 pixels per side; GPU
+memory may impose lower practical limits. PNG transport preserves 8-bit pixels,
+not arbitrary floating-point/HDR values.
 
-   ```powershell
-   .\bin\python-3.13.15-embed-amd64\python.exe -m pip install -r requirements-vts.txt
-   ```
+`/vts/interpolate` remains unchanged: lossless chunked PNG, bounded buffers,
+persistent GPU sessions and generated-frame-only responses. See
+[VTS interpolation](VTS_INTERPOLATION.md).
 
-3. To retain all older VTS DLSS scaling/preset workflows, obtain the
-   [v7.0 release archive](https://github.com/Merserk/dlss5-visual-enhancer/releases/tag/v7.0)
-   and install its compatibility runtime into a separate folder:
+## GUI and upstream code
 
-   ```powershell
-   .\bin\python-3.13.15-embed-amd64\python.exe tools\install_legacy_runtime.py "path\to\DLSS.5.Visual.Enhancer.v7.0.zip"
-   ```
+Upstream's rendering engines, native NR Passes, composition controls, temporal
+video/Live processing, GPU/RAM paths and overlapped batch processing are retained.
+Our image iteration control and PNG/default versus Do not save choices remain.
+GUI previews can use Gradio's cache; VTS memory API responses bypass it.
 
-4. Start with `start.bat`. Port defaults to 7865. The bind address defaults to
-   loopback. For LAN use, set `GRADIO_SERVER_NAME` to an address belonging to the
-   server before starting; the existing installation uses `192.168.1.1`.
-   `GRADIO_SERVER_PORT` can override the port. Use an appropriate LAN firewall
-   rule. Runtime binaries, configuration, outputs, caches and logs are ignored
-   by Git and are not included in source commits.
+## Setup and verification
 
-The existing VTS nodes require no changes for their current image and interpolation
-requests. The new Neuroframe-only controls can be supplied by API callers; adding
-corresponding VTS GUI widgets is separate work.
+Copy `bin/` from the upstream v8.0 portable release into the source checkout,
+then install `requirements-vts.txt` with its portable Python. Start with
+`start.bat`. Port defaults to 7865; set `GRADIO_SERVER_NAME` to the server's LAN
+address for network use. Runtime binaries, local settings and outputs are not
+committed. Only the current upstream runtime is needed.
 
-## Verification
+Checks (use `bin/python-3.13.15-embed-amd64/python.exe`):
 
-Use the portable Python above (shown as `python` below):
-
-- `python -m unittest discover -s tests -p "test_*.py"`: routing, settings/presets,
-  iterative feedback, no-save output, cancellation, streaming order/chunks,
-  concurrent-request isolation and disconnect cleanup.
-- `python tests/check_image_backend_gpu.py`: real Neuroframe, legacy preset and
-  scaling, VSR, iterations, alpha preservation, GUI no-save and final PNG output.
-- `python tests/check_interpolation_gpu.py`: real 2x, approximate 3x, 4x and 8x.
-- `python tests/check_public_api.py http://127.0.0.1:7866`: live Gradio image,
-  cancellation and WebSocket interpolation contracts against a running server.
-
-GPU checks need the matching runtime and an idle GPU service. They may write
-runtime diagnostic logs. Explicit saved-image checks use temporary directories.
+- `-m unittest discover -s tests -p "test_*.py"`: stage ordering, both loop settings,
+  mixed resizing, cancellation, no-save, settings and interpolation streaming.
+- `tests/check_image_backend_gpu.py`: real VSR then Neuroframe, both loops,
+  preservation controls, alpha, mixed resizing, GUI PNG/no-save behaviour.
+- `tests/check_public_api.py http://192.168.1.1:7865`: deployed image APIs and
+  interpolation stream.
+- `tests/check_interpolation_gpu.py`: native interpolation multipliers.

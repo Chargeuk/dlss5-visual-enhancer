@@ -1,6 +1,6 @@
 > **Chargeuk fork:** Includes upstream Neuroframe improvements, VTS image and
-> interpolation APIs, iterative enhancement and no-save controls. Existing DLSS
-> scaling/preset workflows have an isolated compatibility backend.
+> interpolation APIs, iterative enhancement and no-save controls. Image upscaling
+> uses RTX VSR followed by optional Neuroframe enhancement.
 > See [VTS changes, runtime setup and tests](docs/VTS_CHANGES.md).
 
 # DLSS 5 Visual Enhancer

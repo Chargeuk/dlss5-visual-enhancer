@@ -7,11 +7,11 @@ import json
 import threading
 
 import gradio as gr
-from PIL import Image
+from PIL import Image, ImageOps
 
-from ...core.jobs import JobController
+from ...core.jobs import Cancelled, JobController
 from ...settings.storage import processing_gpu_settings
-from .batch import convert_images
+from .batch import _validate_options, convert_images
 from .models import ImageConversionOptions, NO_SAVE
 from ...upscale.image.models import ImageUpscaleOptions
 from ...upscale.image.processor import upscale_image
@@ -19,12 +19,11 @@ from ...upscale.image.processor import upscale_image
 _controllers: dict[str, JobController] = {}
 _lock = threading.Lock()
 _PARAMETERS = {
-    "upscaling_factor", "iterations", "nr_preset", "nr_style", "nr_intensity",
-    "local_tone_strength", "local_structure_strength", "skin_structure_strength",
-    "automatic_mask", "dlss_model_preset",
-    "target_width", "target_height", "operation", "vsr_quality", "backend",
-    "nr_passes", "nr_color_strength", "tone_preservation", "face_skin_protection",
-    "grain_preservation", "mask_feather", "nr_gpu_mode",
+    "iterations", "nr_style", "nr_intensity", "local_tone_strength",
+    "local_structure_strength", "skin_structure_strength", "automatic_mask",
+    "target_width", "target_height", "operation", "vsr_quality", "nr_passes",
+    "nr_color_strength", "tone_preservation", "face_skin_protection",
+    "grain_preservation", "nr_gpu_mode",
 }
 
 
@@ -33,70 +32,81 @@ def _render_image(image_source, parameters, request_id, progress):
     if not isinstance(values, dict) or values.keys() - _PARAMETERS:
         raise gr.Error("Unknown image parameters. Use the VTS Merserk node's rendering settings.")
     operation = values.pop("operation", "neural")
-    vsr_quality = values.pop("vsr_quality", 4)
     if operation not in {"neural", "vsr"}:
         raise gr.Error("Image operation must be neural or vsr.")
-    backend = values.pop("backend", "auto")
-    if backend not in {"auto", "neuroframe", "legacy"}:
-        raise gr.Error("Backend must be auto, neuroframe or legacy.")
-    legacy_needed = float(values.get("upscaling_factor", 1)) > 1 or any(
-        values.get(name, "Default") != "Default" for name in ("nr_preset", "dlss_model_preset"))
-    if operation == "neural" and values.get("target_width") is not None:
-        if isinstance(image_source, Image.Image):
-            source_size = image_source.size
-        else:
-            with Image.open(image_source) as source:
-                source_size = source.size
-        legacy_needed = legacy_needed or values["target_width"] > source_size[0] or values["target_height"] > source_size[1]
-    if backend == "neuroframe" and legacy_needed:
-        raise gr.Error("These scaling or preset settings require backend=legacy. Neuroframe supports native-size enhancement and downscaling; use the VSR operation for separate upscaling.")
-    use_legacy = backend == "legacy" or (backend == "auto" and legacy_needed)
-    renderer, option_class = convert_images, ImageConversionOptions
-    if operation == "neural" and use_legacy:
-        from ...legacy.images import convert_images as legacy_render
-        from ...legacy.models import ImageConversionOptions as LegacyOptions
-        renderer, option_class = legacy_render, LegacyOptions
-        unsupported = set(values) - set(LegacyOptions.__dataclass_fields__)
-        if unsupported:
-            raise gr.Error("Legacy backend does not support: " + ", ".join(sorted(unsupported)))
-    else:
-        values.pop("nr_preset", None)
-        values.pop("dlss_model_preset", None)
-    gpu_uuid = processing_gpu_settings()[0]
-    if operation == "vsr":
-        width, height = values.get("target_width"), values.get("target_height")
-        if width is None or height is None:
-            raise gr.Error("RTX VSR requires both target_width and target_height.")
-        options = ImageUpscaleOptions(ai_gpu_uuid=gpu_uuid, vsr_quality=vsr_quality,
-                                      size_mode="Custom dimensions", width=width,
-                                      height=height, aspect_lock=False, output_format=NO_SAVE)
-    else:
-        options = option_class(ai_gpu_uuid=gpu_uuid, output_format=NO_SAVE, **values)
-    controller = JobController()
+    vsr_quality = values.pop("vsr_quality", 4)
+    width, height = values.pop("target_width", None), values.pop("target_height", None)
     if not request_id or len(request_id) > 128:
         raise gr.Error("A request ID is required.")
+    if operation == "vsr" and values:
+        raise gr.Error("Neural settings require the neural operation.")
+    controller = JobController()
     with _lock:
         if request_id in _controllers:
             raise gr.Error("This request ID is already rendering.")
         _controllers[request_id] = controller
+    current = None
     try:
-        rendered = []
-        def receive_image(image, name):
-            rendered.append(image.copy())
-        report_progress = lambda value, message: progress(value, desc=message)
-        if operation == "vsr":
-            upscale_image(image_source, options, controller=controller, progress=report_progress,
-                          generate_previews=False, on_image=receive_image)
+        if isinstance(image_source, Image.Image):
+            current = ImageOps.exif_transpose(image_source)
         else:
-            result = renderer(
-                [image_source], options, controller=controller,
-                progress=report_progress, generate_previews=False, create_zip=False,
-                on_image=receive_image,
-            )
+            with Image.open(image_source) as source:
+                current = ImageOps.exif_transpose(source)
+        if width is None and height is None:
+            width, height = current.size
+        if any(isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 16384
+               for n in (width, height)):
+            raise gr.Error("Both target dimensions must be integers from 1 to 16384.")
+        gpu_uuid = processing_gpu_settings()[0]
+        neural_options = None
+        if operation == "neural":
+            neural_options = _validate_options(ImageConversionOptions(
+                ai_gpu_uuid=gpu_uuid, output_format=NO_SAVE,
+                target_width=width, target_height=height, **values))
+        upscale_options = ImageUpscaleOptions(
+            ai_gpu_uuid=gpu_uuid, vsr_quality=vsr_quality,
+            size_mode="Custom dimensions", width=width, height=height,
+            aspect_lock=False, output_format=NO_SAVE)
+        upscale_options.validate()
+
+        def check_cancel():
+            if controller.cancel.is_set():
+                raise Cancelled("Image rendering stopped by user.")
+
+        def receive_image(image, name):
+            nonlocal current
+            replacement = image.copy()
+            current.close()
+            current = replacement
+
+        # Shrink only the necessary axes; VSR handles every enlargement once.
+        # VTS normally does this locally to avoid uploading unnecessary pixels.
+        check_cancel()
+        reduced_size = (min(current.width, width), min(current.height, height))
+        if reduced_size != current.size:
+            reduced = current.resize(reduced_size, Image.Resampling.LANCZOS)
+            current.close()
+            current = reduced
+        needs_upscale = current.size != (width, height)
+        if needs_upscale:
+            upscale_image(current, upscale_options, controller=controller,
+                          progress=lambda v, m: progress(v * (.35 if neural_options else 1), desc=m),
+                          generate_previews=False, on_image=receive_image)
+        check_cancel()
+        if neural_options is not None:
+            offset = .35 if needs_upscale else 0
+            result = convert_images(
+                [current], neural_options, controller=controller,
+                progress=lambda v, m: progress(offset + v * (1 - offset), desc=m),
+                generate_previews=False, create_zip=False, on_image=receive_image)
             if not result.successes:
                 raise gr.Error(result.failures[0].error if result.failures else "Image rendering was cancelled.")
-        return rendered[0]
+        check_cancel()
+        final, current = current, None
+        return final
     finally:
+        if current is not None:
+            current.close()
         with _lock:
             _controllers.pop(request_id, None)
 

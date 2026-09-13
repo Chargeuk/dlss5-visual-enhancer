@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PIL import Image
 from src.neural_rendering.image import api, batch, ui
 from src.upscale.image import processor, ui as vsr_ui
-from src.legacy import images as legacy
 from src.settings.models import UISettings
 from src.settings.storage import save_settings, load_settings
 import gradio as gr
@@ -27,15 +26,14 @@ def memory_only(image, target, *args, **kwargs):
 
 for name, options, expected in [
     ('neuroframe', dict(iterations=2, nr_passes=2), (128, 96)),
-    ('legacy-upscale', dict(target_width=192, target_height=144, upscaling_factor=1.5, iterations=2), (192, 144)),
-    ('legacy-preset', dict(nr_preset='Preset #1', iterations=1), (128, 96)),
+    ('vsr-then-neuroframe', dict(target_width=192, target_height=144, iterations=3, nr_passes=2, nr_color_strength=.8, tone_preservation=.3, face_skin_protection=.2, grain_preservation=.1), (192, 144)),
+    ('mixed-resize', dict(target_width=96, target_height=144, iterations=2), (96, 144)),
     ('vsr', dict(operation='vsr', target_width=192, target_height=144), (192, 144)),
 ]:
     print('RUN memory API', name, flush=True)
     with patch.object(Image.Image, 'save', memory_only), \
          patch.object(batch, 'OutputFile', side_effect=AssertionError('NR file write')), \
          patch.object(batch, 'prepare_output_dir', side_effect=AssertionError('NR directory')), \
-         patch.object(legacy, 'OutputFile', side_effect=AssertionError('legacy file write')), \
          patch.object(processor, 'OutputFile', side_effect=AssertionError('VSR file write')):
         returned = api.enhance_image_memory(encoded, json.dumps(options), 'check-' + name)
     with Image.open(io.BytesIO(base64.b64decode(returned))) as output:

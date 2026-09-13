@@ -14,7 +14,6 @@ import numpy as np
 from PIL import Image
 from src.neural_rendering.image import api, batch, ui
 from src.neural_rendering.image.models import ImageConversionOptions, NO_SAVE
-from src.legacy import images as legacy
 from src.settings.models import UISettings, _validate
 from src.settings.storage import load_settings, save_settings
 from src.settings.presets import preset_document, import_settings_preset
@@ -52,25 +51,65 @@ class MergeTests(unittest.TestCase):
         kwargs['on_image'](sources[0], 'test.png')
         return SimpleNamespace(successes=[object()])
 
-    def test_auto_uses_modern_renderer_for_compatible_vts_settings(self):
-        with patch.object(api, 'convert_images', self.renderer):
-            result = api._render_image(self.source, json.dumps(dict(nr_preset='Default', dlss_model_preset='Default', iterations=3)), 'modern-test', lambda *a, **k: None)
-        self.assertEqual(self.options.iterations, 3)
+    def test_modern_renderer_receives_both_loops_and_controls(self):
+        values = dict(iterations=3, nr_passes=2, nr_color_strength=.6,
+                      tone_preservation=.3, face_skin_protection=.4, grain_preservation=.2)
+        with patch.object(api, 'convert_images', self.renderer), \
+             patch.object(api, 'upscale_image', side_effect=AssertionError('unneeded upscale')):
+            result = api._render_image(self.source, json.dumps(values), 'modern-test', lambda *a, **k: None)
+        for key, value in values.items(): self.assertEqual(getattr(self.options, key), value)
         self.assertEqual(self.options.output_format, NO_SAVE)
         self.assertEqual(result.size, self.source.size)
         self.assertEqual(api._controllers, {})
 
-    def test_auto_preserves_legacy_scaling_and_presets(self):
-        for values in (dict(upscaling_factor=1.5), dict(nr_preset='Preset #2'), dict(dlss_model_preset='K')):
-            with self.subTest(values=values), patch.object(legacy, 'convert_images', self.renderer):
-                result = api._render_image(self.source, json.dumps(values), 'legacy-test', lambda *a, **k: None)
-            self.assertEqual(result.size, self.source.size)
-            for key, value in values.items(): self.assertEqual(getattr(self.options, key), value)
+    def test_upscale_once_then_neural_at_exact_size(self):
+        events = []
+        def upscale(source, options, **kwargs):
+            events.append(('vsr', source.size, options.vsr_quality))
+            with source.resize((options.width, options.height)) as enlarged:
+                enlarged.putpixel((0, 0), (90, 20, 30, 180))
+                kwargs['on_image'](enlarged, 'upscaled')
+        def render(sources, options, **kwargs):
+            events.append(('nr', sources[0].size, sources[0].getpixel((0,0))[0]))
+            return self.renderer(sources, options, **kwargs)
+        with patch.object(api, 'upscale_image', upscale), patch.object(api, 'convert_images', render):
+            result = api._render_image(self.source, json.dumps(dict(target_width=192, target_height=144,
+                       vsr_quality=3, iterations=3, nr_passes=2)), 'combined-test', lambda *a, **k: None)
+        self.assertEqual(events, [('vsr', (128, 96), 3), ('nr', (192,144), 90)])
+        self.assertEqual((self.options.iterations, self.options.nr_passes), (3,2))
+        self.assertEqual(self.options.upscaling_factor, 1)
+        self.assertEqual(result.size, (192,144))
 
-    def test_explicit_backend_never_silently_drops_unsupported_controls(self):
-        for values in (dict(backend='neuroframe', dlss_model_preset='K'), dict(backend='legacy', nr_passes=2)):
-            with self.subTest(values=values), self.assertRaises(gr.Error):
-                api._render_image(self.source, json.dumps(values), 'invalid-test', lambda *a, **k: None)
+    def test_mixed_resize_shrinks_only_one_axis_before_vsr(self):
+        seen = []
+        def upscale(source, options, **kwargs):
+            seen.append(source.size)
+            with source.resize((options.width,options.height)) as final:
+                kwargs['on_image'](final, 'test')
+        with patch.object(api, 'upscale_image', upscale), \
+             patch.object(api, 'convert_images', side_effect=AssertionError('neural disabled')):
+            result = api._render_image(self.source, json.dumps(dict(operation='vsr', target_width=64,
+                        target_height=192)), 'mixed-test', lambda *a, **k: None)
+        self.assertEqual(seen, [(64,96)])
+        self.assertEqual(result.size, (64,192))
+
+    def test_invalid_dimensions_or_passes_fail_before_upscaling(self):
+        for values in (dict(target_width=192), dict(target_width=192, target_height=144, nr_passes=5)):
+            with self.subTest(values=values), patch.object(api, 'upscale_image', side_effect=AssertionError('GPU work')):
+                with self.assertRaises((ValueError, gr.Error)):
+                    api._render_image(self.source, json.dumps(values), 'invalid-test', lambda *a, **k: None)
+            self.assertEqual(api._controllers, {})
+
+    def test_cancellation_between_stages_skips_neural(self):
+        def upscale(source, options, **kwargs):
+            kwargs['on_image'](source, 'test')
+            kwargs['controller'].stop()
+        with patch.object(api, 'upscale_image', upscale), \
+             patch.object(api, 'convert_images', side_effect=AssertionError('neural after cancellation')):
+            with self.assertRaises(Cancelled):
+                api._render_image(self.source, json.dumps(dict(target_width=192,target_height=144)),
+                                  'cancel-stages', lambda *a, **k: None)
+        self.assertEqual(api._controllers, {})
 
     def test_cancel_only_targets_its_request(self):
         first, second = JobController(), JobController()

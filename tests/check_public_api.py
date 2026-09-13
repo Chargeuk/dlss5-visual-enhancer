@@ -9,7 +9,7 @@ url=sys.argv[1].rstrip('/') if len(sys.argv)>1 else 'http://127.0.0.1:7866'
 with Image.new('RGBA',(128,96),(150,100,50,180)) as source, io.BytesIO() as buffer:
     source.save(buffer,format='PNG'); encoded=base64.b64encode(buffer.getvalue()).decode()
 client=Client(url,download_files=False,verbose=False)
-for name,params,size in [('modern',{'iterations':2,'nr_preset':'Default','dlss_model_preset':'Default'},(128,96)),('legacy',{'iterations':2,'upscaling_factor':1.5,'target_width':192,'target_height':144,'nr_preset':'Default','dlss_model_preset':'Default'},(192,144)),('vsr',{'operation':'vsr','target_width':192,'target_height':144},(192,144))]:
+for name,params,size in [('modern',{'iterations':2,'nr_passes':2},(128,96)),('vsr-then-neuroframe',{'iterations':3,'nr_passes':2,'target_width':192,'target_height':144},(192,144)),('vsr',{'operation':'vsr','target_width':192,'target_height':144},(192,144))]:
     returned=client.predict(encoded,json.dumps(params),'public-'+name,api_name='/vts_enhance_memory')
     with Image.open(io.BytesIO(base64.b64decode(returned))) as image: assert image.size==size
     print('PASS public image API',name,flush=True)
