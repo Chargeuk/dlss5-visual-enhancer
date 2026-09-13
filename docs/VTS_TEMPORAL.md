@@ -47,10 +47,18 @@ For each input, the server replies with an `enhanced` header (`index`, `bytes`,
 aggregate frame, cut, VSR and neural evaluation statistics. Errors send `error` and
 close the stream. Each new request starts fresh history.
 
+Fatal neural worker failures include `code: NEURAL_WORKER_RESTARTED`. The updated
+VTS node replays the entire sequence once on a fresh connection, rebuilding VSR
+and neural history from original inputs. See [worker recovery](WORKER_RECOVERY.md).
+
 The client allows at most two outstanding uploads. The server has one queued frame
 and processes GPU work on one dedicated worker thread. GPU calls are serialized
 with existing Merserk jobs; disconnects cancel their own request and release native
-resources before the next request can claim the GPU slot.
+resources before the next request can claim the GPU slot. GUI and API jobs wait in
+the same FIFO queue. A setup with `queue_status: true` receives periodic `queued`
+messages with a one-based `position` before `ready`; updated VTS clients extend
+their readiness deadline on each message. Legacy clients wait silently up to their
+readiness timeout. Queued disconnects remove only that request.
 
 No server image, video, manifest or ZIP output files are created. PNG encoding and
 stage handoff happen in memory; diagnostic logs may still be written. PNG preserves

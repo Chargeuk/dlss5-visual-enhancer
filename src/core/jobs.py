@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import threading
+import time
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Iterator
 
@@ -50,9 +52,9 @@ class JobController:
                     pass
 
 
-_RENDER_LOCK = threading.Lock()
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE: JobController | None = None
+_WAITING = deque()
 _JOB_CONTEXT = ContextVar("render_job_controller", default=None)
 
 
@@ -69,23 +71,109 @@ def use_job_controller(controller: JobController):
         _JOB_CONTEXT.reset(token)
 
 
+def _enqueue(controller):
+    ticket = object()
+    with _ACTIVE_LOCK:
+        _WAITING.append(ticket)
+    return ticket
+
+
+def _try_claim(ticket, controller):
+    global _ACTIVE
+    with _ACTIVE_LOCK:
+        if controller.cancel.is_set():
+            raise Cancelled("Queued render cancelled.")
+        if _ACTIVE is None and _WAITING and _WAITING[0] is ticket:
+            _WAITING.popleft()
+            _ACTIVE = controller
+            return True
+    return False
+
+
+def _position(ticket):
+    with _ACTIVE_LOCK:
+        return _WAITING.index(ticket) + 1
+
+
+def _leave(ticket, controller, claimed):
+    global _ACTIVE
+    try:
+        if claimed:
+            controller.terminate_processes()
+    finally:
+        with _ACTIVE_LOCK:
+            if claimed and _ACTIVE is controller:
+                _ACTIVE = None
+            with suppress(ValueError):
+                _WAITING.remove(ticket)
+
+
+def _report_wait(position):
+    # Gradio associates progress with the current request, not another GUI.
+    with suppress(Exception):
+        import gradio as gr
+        gr.Progress()(0, desc=f"Waiting for GPU — queue position {position}")
+
+
 @contextmanager
 def active_job(controller: JobController | None = None) -> Iterator[JobController]:
-    """Claim the single GPU render slot and always release its resources."""
-    global _ACTIVE
-    if not _RENDER_LOCK.acquire(blocking=False):
-        raise RuntimeError("Another GPU render is already running.")
+    """Wait in FIFO order; cancellation removes only this queued request."""
     controller = controller or current_job_controller() or JobController()
-    with _ACTIVE_LOCK:
-        _ACTIVE = controller
+    ticket = _enqueue(controller)
+    claimed = False
+    previous = None
     try:
+        while not claimed:
+            claimed = _try_claim(ticket, controller)
+            if not claimed:
+                position = _position(ticket)
+                if position != previous:
+                    _report_wait(position)
+                    previous = position
+                controller.cancel.wait(.1)
         yield controller
     finally:
-        controller.terminate_processes()
-        with _ACTIVE_LOCK:
-            if _ACTIVE is controller:
-                _ACTIVE = None
-        _RENDER_LOCK.release()
+        _leave(ticket, controller, claimed)
+
+
+@asynccontextmanager
+async def queued_socket_job(websocket, controller, setup):
+    """Use the same FIFO without blocking ASGI; watch queued disconnects."""
+    from starlette.websockets import WebSocketDisconnect
+    ticket = _enqueue(controller)
+    claimed = False
+    disconnected = asyncio.create_task(websocket.receive())
+    next_notice = 0
+    deadline = time.monotonic() + setup.get("timeout_seconds", 600)
+    try:
+        while not claimed:
+            if disconnected.done():
+                message = disconnected.result()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                raise ValueError("Wait for server readiness before sending frames.")
+            claimed = _try_claim(ticket, controller)
+            if not claimed:
+                now = time.monotonic()
+                if setup.get("queue_status", False):
+                    if now >= next_notice:
+                        await asyncio.wait_for(websocket.send_json(dict(
+                            type="queued", position=_position(ticket))), 10)
+                        next_notice = now + min(5, setup.get("timeout_seconds", 600) / 3)
+                elif now >= deadline:
+                    raise TimeoutError("Timed out waiting for the GPU queue.")
+                await asyncio.sleep(.1)
+        disconnected.cancel()
+        with suppress(asyncio.CancelledError):
+            await disconnected
+        yield controller
+    finally:
+        disconnected.cancel()
+        try:
+            with suppress(BaseException):
+                await disconnected
+        finally:
+            _leave(ticket, controller, claimed)
 
 
 def cancel_active_job() -> str:

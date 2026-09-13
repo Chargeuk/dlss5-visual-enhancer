@@ -100,8 +100,9 @@ class ServerTests(unittest.TestCase):
             first.send_json(self.setup)
             first.receive_json()
             with self.connect() as second:
-                second.send_json(self.setup)
-                self.assertIn('already running', second.receive_json()['message'])
+                second.send_json(dict(self.setup, queue_status=True))
+                self.assertEqual(second.receive_json(), dict(type='queued', position=1))
+                self.assertEqual(len(FakeGPU.instances), 1)
             self.assertFalse(FakeGPU.instances[0].controller.cancel.is_set())
 
     def test_invalid_setup(self):

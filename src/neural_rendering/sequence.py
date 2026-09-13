@@ -12,8 +12,9 @@ from PIL import Image
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from ..core.gpu_selection import resolve_runtime_ai_gpu
-from ..core.jobs import Cancelled, JobController, active_job
+from ..core.jobs import Cancelled, JobController, queued_socket_job
 from ..core.runtime import DLSSFrameSession, prepare_runtime, resolve_native_settings, resolve_upscaling_mode, verify_feature_18
+from ..core.neural_worker import WorkerLost, RECOVERY_CODE
 from ..settings.storage import processing_gpu_settings
 from ..upscale.image.processor import srgb_to_worker, worker_to_srgb
 from ..upscale.video.models import UpscaleOptions
@@ -35,9 +36,11 @@ def validate_setup(value):
     if not isinstance(value, dict) or value.get("version") != 1:
         raise ValueError("VTS temporal enhancement protocol version 1 is required.")
     allowed = {"version", "width", "height", "target_width", "target_height", "frame_count",
-               "channels", "enable_neural_rendering", "vsr_quality", "parameters", "timeout_seconds"}
+               "channels", "enable_neural_rendering", "vsr_quality", "parameters", "timeout_seconds", "queue_status"}
     if value.keys() - allowed:
         raise ValueError("Unknown sequence settings.")
+    if not isinstance(value.get("queue_status", False), bool):
+        raise ValueError("queue_status must be a boolean.")
     for name in ("width", "height", "target_width", "target_height"):
         n = value.get(name)
         if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 16384:
@@ -100,7 +103,8 @@ class EnhancementSequence:
                 output_width=self.target[0], output_height=self.target[1],
                 frame_count=self.setup["frame_count"], warmup_frames=0, factor=factor, mode=mode,
                 native_settings=resolve_native_settings(options), gpu=gpu,
-                runtime_bundle=prepared.runtime_bundle, controller=self.controller)
+                runtime_bundle=prepared.runtime_bundle, controller=self.controller,
+                recover_reset_frames=False)
             # Detect cuts from source frames, before model-created changes.
             self.guides = TemporalGuideGenerator(*self.reduced)
 
@@ -208,7 +212,7 @@ async def enhancement_socket(websocket: WebSocket):
         async def run(function, *args):
             return await asyncio.get_running_loop().run_in_executor(executor, function, *args)
 
-        with active_job(controller):
+        async with queued_socket_job(websocket, controller, setup):
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vts-temporal")
             stream = EnhancementSequence(setup, controller)
             receiver = asyncio.create_task(receive_frames())
@@ -247,7 +251,8 @@ async def enhancement_socket(websocket: WebSocket):
         controller.stop()
     except Exception as exc:
         with suppress(Exception):
-            await websocket.send_json(dict(type="error", message=str(exc)))
+            await websocket.send_json(dict(type="error", message=str(exc),
+                code=RECOVERY_CODE if isinstance(exc, WorkerLost) else None))
     finally:
         if receiver is not None:
             receiver.cancel()

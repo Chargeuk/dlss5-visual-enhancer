@@ -111,11 +111,22 @@ class LiveSession(threading.Thread):
                 setattr(self.info, key, value)
 
     def snapshot(self) -> LiveSessionInfo:
+        if hasattr(self, '_remote_snapshot'):
+            with self._info_lock:
+                return replace(self._remote_snapshot, failures=list(self._remote_snapshot.failures))
         effects = self.effects.snapshot()
         with self._info_lock:
             return replace(self.info, failures=list(self.info.failures), **effects)
 
     def request_effects(self, settings) -> bool:
+        remote = getattr(self, '_remote_worker', None)
+        if remote is not None:
+            accepted = remote.call(dict(op='live_effects',settings=settings),self.controller)['accepted']
+            if accepted:
+                from dataclasses import fields
+                selected = EffectSettings.from_options(settings)
+                self.options = replace(self.options, **{field.name:getattr(selected,field.name) for field in fields(selected)})
+            return accepted
         return self.effects.submit(settings)
 
     def stop(self) -> None:
@@ -923,6 +934,9 @@ class LiveSession(threading.Thread):
         return
 
     def run(self) -> None:
+        if os.environ.get('MERSERK_NEURAL_WORKER') != '1':
+            self._run_remote()
+            return
         started = time.monotonic()
         self._started_at = started
         server = None
@@ -998,6 +1012,54 @@ class LiveSession(threading.Thread):
                 _LAST = self.snapshot()
                 if _CURRENT is self:
                     _CURRENT = None
+
+    def _run_remote(self):
+        from ..core.neural_worker import Worker, WorkerLost
+        remote = self._remote_worker = Worker()
+        try:
+            with active_job(self.controller):
+                for attempt in range(2):
+                    try:
+                        remote.call(dict(op='live_start',options=self.options), self.controller)
+                        while True:
+                            reply = remote.call(dict(op='live_status'), self.controller)
+                            with self._info_lock:
+                                self._remote_snapshot = self.info = reply['info']
+                            self._remote_directory = reply.get('directory')
+                            if reply['ready']: self._ready.set()
+                            if not self.info.processing: break
+                            self.controller.cancel.wait(.2)
+                        break
+                    except WorkerLost:
+                        if attempt: raise
+                        self._set(status='Restarting neural worker and reconnecting live source...')
+            # Playback can remain open without occupying the GPU queue.
+            while self.info.running:
+                self.controller.cancel.wait(.25)
+                reply = remote.call(dict(op='live_status'), self.controller)
+                with self._info_lock:
+                    self._remote_snapshot = self.info = reply['info']
+        except Exception as exc:
+            cancelled = self.controller.cancel.is_set()
+            self._set(status='Stopped.' if cancelled else f'Failed: {exc}',
+                      failures=[] if cancelled else [str(exc)])
+        finally:
+            if remote.process is not None and remote.process.poll() is None:
+                with suppress(Exception):
+                    remote.call(dict(op='live_stop'),JobController(),timeout=10)
+            remote.stop()
+            directory = getattr(self, '_remote_directory', None)
+            if directory and not self.options.keep_files:
+                directory = Path(directory).resolve()
+                if directory.parent == LIVE_DIR.resolve() and directory.name.startswith('live-'):
+                    shutil.rmtree(directory,ignore_errors=True)
+            self._remote_worker = None
+            self._set(running=False,processing=False,mpv_running=False,playlist_url='')
+            self._ready.set(); self._produced.set()
+            with _LOCK:
+                global _CURRENT, _LAST
+                _LAST = self.snapshot()
+                if _CURRENT is self: _CURRENT = None
 
 
 def start_live_session(options: LiveOptions) -> LiveSessionInfo:

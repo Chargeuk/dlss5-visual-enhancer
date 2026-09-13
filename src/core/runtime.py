@@ -1072,3 +1072,11 @@ def close_prepared_runtime() -> None:
         _PREPARED = None
     if prepared is not None:
         prepared.close()
+
+
+# CUDA video pipelines are delegated as whole jobs, so their AVFrames never
+# cross process boundaries. Host-frame callers share the restartable worker.
+import os as _worker_os
+NativeDLSSFrameSession = DLSSFrameSession
+if _worker_os.environ.get('MERSERK_NEURAL_WORKER') != '1':
+    from .neural_worker import RemoteFrameSession as DLSSFrameSession

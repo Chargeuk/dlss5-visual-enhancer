@@ -94,6 +94,9 @@ def convert_video(
 
     with job_context as controller:
         assert controller is not None
+        if os.environ.get('MERSERK_NEURAL_WORKER') != '1':
+            from ...core.neural_worker import worker_video
+            return worker_video(source, options, output_dir, controller, progress)
         if options.nr_gpu_mode and ffmpeg._is_nvenc_codec(options.codec):
             from .cuda_pipeline import convert_video_cuda_nvenc
 

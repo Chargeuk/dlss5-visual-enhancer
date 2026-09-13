@@ -51,6 +51,18 @@ and Neuroframe sessions. See [VTS temporal enhancement](VTS_TEMPORAL.md).
 
 ## GUI and upstream code
 
+GPU requests now share a cancellation-aware FIFO queue, including GUI previews,
+image rendering and both streaming endpoints. Waiting GUI jobs report their queue
+position through Gradio progress. Streaming clients can negotiate `queue_status`
+heartbeats; without that flag, the original readiness protocol is retained.
+
+Failed native crash recovery and a lost bridge initialization state are treated
+as an unusable native session. Subsequent requests explicitly require an application
+restart rather than suggesting that changing from VRAM to RAM will repair it.
+The restartable worker supervisor now replaces that entire child process and
+performs bounded recovery without reusing invalid CUDA buffers. See
+[worker recovery](WORKER_RECOVERY.md) for retries and temporal replay behaviour.
+
 Upstream's rendering engines, native NR Passes, composition controls, temporal
 video/Live processing, GPU/RAM paths and overlapped batch processing are retained.
 Our image iteration control and PNG/default versus Do not save choices remain.

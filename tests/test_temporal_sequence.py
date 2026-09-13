@@ -159,13 +159,26 @@ class SocketTests(unittest.TestCase):
         with self.connect() as socket:
             socket.send_json(self.setup); self.assertEqual(socket.receive_json()['type'],'ready')
 
-    def test_busy_client_cannot_cancel_owner(self):
+    def test_queued_client_disconnect_cannot_cancel_owner(self):
         with self.connect() as first:
             first.send_json(self.setup); first.receive_json()
             with self.connect() as second:
-                second.send_json(self.setup)
-                self.assertIn('already running',second.receive_json()['message'])
+                second.send_json(dict(self.setup,queue_status=True))
+                self.assertEqual(second.receive_json(),dict(type='queued',position=1))
+                self.assertEqual(len(FakeSequence.instances),1)
             self.assertFalse(FakeSequence.instances[0].controller.cancel.is_set())
+
+    def test_queued_client_starts_after_owner_completes(self):
+        with self.connect() as first, self.connect() as second:
+            first.send_json(self.setup); first.receive_json()
+            second.send_json(dict(self.setup,queue_status=True))
+            self.assertEqual(second.receive_json()['type'],'queued')
+            for i in range(2):
+                self.send_frame(first,i); first.receive_json(); first.receive_bytes()
+            first.send_json(dict(type='end'))
+            self.assertEqual(first.receive_json()['type'],'done')
+            self.assertEqual(second.receive_json()['type'],'ready')
+            self.assertTrue(FakeSequence.instances[0].closed.is_set())
 
     def test_invalid_order_and_renderer_failure_cleanup(self):
         for fail in (False,True):

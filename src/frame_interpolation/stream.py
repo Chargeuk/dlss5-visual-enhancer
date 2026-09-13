@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from ..core.jobs import JobController, active_job
+from ..core.jobs import JobController, queued_socket_job
 from .capabilities import probe_frame_interpolation_capabilities
 from .native import DirectDLSSGSession
 from .processor import DLSSGStage, TimedFrame
@@ -24,6 +24,8 @@ IDLE_TIMEOUT = 120
 def validate_setup(value):
     if not isinstance(value, dict) or value.get("version") != 1:
         raise ValueError("VTS interpolation protocol version 1 is required.")
+    if not isinstance(value.get("queue_status", False), bool):
+        raise ValueError("queue_status must be a boolean.")
     for name in ("width", "height", "frame_count", "multiplier"):
         if isinstance(value.get(name), bool) or not isinstance(value.get(name), int):
             raise ValueError(f"{name} must be an integer.")
@@ -165,7 +167,7 @@ async def interpolation_socket(websocket: WebSocket):
                 if not waiting.done():
                     waiting.cancel()
 
-        with active_job(controller):
+        async with queued_socket_job(websocket, controller, setup):
             stream = InterpolationStream(setup, controller)
             receiver = asyncio.create_task(receive_frames())
             try:

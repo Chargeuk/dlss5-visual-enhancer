@@ -63,5 +63,8 @@ count and fractional interpolation positions. Each input has a numbered `frame`
 header with PNG byte length, followed by binary chunks; the client finishes with
 `end`. Replies are `generated` headers plus PNG chunks, local `repeat` references,
 `frame_done`, then `done` after GPU cleanup. Failures return `error` and close the
-connection. One GPU job runs at a time; a busy server rejects another request
-without cancelling its current job.
+connection. One GPU job runs at a time; other requests wait in the shared FIFO
+queue. Optional `queue_status: true` enables periodic `queued` messages containing
+a one-based `position` before `ready`. Updated clients extend only the readiness
+deadline on these messages. Legacy clients wait silently up to their existing
+timeout. Disconnecting a queued client removes only its own request.

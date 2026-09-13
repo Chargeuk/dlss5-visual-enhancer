@@ -887,6 +887,16 @@ class NeuralBridgeManager:
                 f"{self._poisoned_reason}. Restart the application before rendering again."
             )
 
+    def _check_native_failure(self, detail: str) -> None:
+        # A native recovery failure leaves Python's cached adapter alive while
+        # the DLL has no usable device. Do not retry with stale CUDA surfaces.
+        if any(marker in detail.lower() for marker in (
+            "corrupt", "access violation", "reinitialization failed after native crash",
+            "bridge not initialized",
+        )):
+            self._poisoned_reason = detail
+            self._guard_poison()
+
     def _call_with_watchdog(
         self, label: str, function: Callable[[], Any], references: tuple[Any, ...] = (),
         *, timeout_seconds: float = BRIDGE_WATCHDOG_SECONDS,
@@ -986,6 +996,8 @@ class NeuralBridgeManager:
                 self._library.dlss5nr_cuda_status(cuda_status, len(cuda_status))
             )
             cuda_detail = _text(cuda_status.value) or "unavailable"
+            if not cuda_ready:
+                self._check_native_failure(cuda_detail)
             if require_cuda and not cuda_ready:
                 raise NeuralBridgeError(
                     f"CUDA/D3D12 interoperability is unavailable ({cuda_detail}). "
@@ -1078,6 +1090,7 @@ class NeuralBridgeManager:
             )
             if not handle:
                 detail = _text(error.value) or "unknown CUDA output allocation failure"
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
                     f"CUDA/D3D12 output allocation failed: {detail}. Switch GPU OFF to "
                     "use host staging."
@@ -1221,11 +1234,7 @@ class NeuralBridgeManager:
                 elapsed = time.perf_counter() - started
                 if not ok:
                     detail = _text(error.value) or "unknown CUDA frame-ABI failure"
-                    if "corrupt" in detail.lower() or "access violation" in detail.lower():
-                        self._poisoned_reason = detail
-                        raise NeuralBridgePoisonedError(
-                            f"{detail}. Restart the application before rendering again."
-                        )
+                    self._check_native_failure(detail)
                     raise NeuralBridgeError(
                         f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF to "
                         "use host staging."
@@ -1314,6 +1323,7 @@ class NeuralBridgeManager:
             self._cuda_driver.deactivate()
             if not ok:
                 detail = _text(error.value) or "unknown CUDA scene-scoring failure"
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
                     f"CUDA reduced-luma scene scoring failed: {detail}. Switch GPU OFF "
                     "to use host staging."
@@ -1382,6 +1392,7 @@ class NeuralBridgeManager:
                 self._cuda_driver.deactivate()
                 if not ok:
                     detail = _text(error.value) or "unknown host-to-CUDA frame failure"
+                    self._check_native_failure(detail)
                     raise NeuralBridgeError(
                         f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF "
                         "to use host staging."
@@ -1487,6 +1498,7 @@ class NeuralBridgeManager:
             self._cuda_driver.deactivate()
             if not ok:
                 detail = _text(error.value) or "unknown CUDA-to-host frame failure"
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
                     f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF to "
                     "use host staging."
@@ -1535,11 +1547,7 @@ class NeuralBridgeManager:
             elapsed = time.perf_counter() - started
             if not ok:
                 detail = _text(error.value) or "unknown feature-18 failure"
-                if "corrupt" in detail.lower() or "access violation" in detail.lower():
-                    self._poisoned_reason = detail
-                    raise NeuralBridgePoisonedError(
-                        f"{detail}. Restart the application before rendering again."
-                    )
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(f"Feature-18 evaluation failed: {detail}")
             return elapsed
 
@@ -1580,11 +1588,7 @@ class NeuralBridgeManager:
             evaluate_seconds = time.perf_counter() - evaluate_started
             if not ok:
                 detail = _text(error.value) or "unknown CUDA interoperability failure"
-                if "corrupt" in detail.lower() or "access violation" in detail.lower():
-                    self._poisoned_reason = detail
-                    raise NeuralBridgePoisonedError(
-                        f"{detail}. Restart the application before rendering again."
-                    )
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
                     f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF to "
                     "use host staging."
