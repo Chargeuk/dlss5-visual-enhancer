@@ -46,6 +46,9 @@ not arbitrary floating-point/HDR values.
 persistent GPU sessions and generated-frame-only responses. See
 [VTS interpolation](VTS_INTERPOLATION.md).
 
+`/vts/enhance_sequence` adds ordered temporal enhancement with persistent RTX VSR
+and Neuroframe sessions. See [VTS temporal enhancement](VTS_TEMPORAL.md).
+
 ## GUI and upstream code
 
 Upstream's rendering engines, native NR Passes, composition controls, temporal

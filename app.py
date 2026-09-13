@@ -30,6 +30,7 @@ except Exception:
 import gradio as gr
 from starlette.routing import WebSocketRoute
 from src.frame_interpolation.stream import interpolation_socket
+from src.neural_rendering.sequence import enhancement_socket
 from src.neural_rendering.image.api import register_image_api
 
 from src.about.ui import build_about_tab
@@ -530,7 +531,8 @@ def main() -> None:
             css=APP_CSS,
             theme=gr.themes.Ocean(),
             server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
-            app_kwargs={"routes": [WebSocketRoute("/vts/interpolate", interpolation_socket)]},
+            app_kwargs={"routes": [WebSocketRoute("/vts/interpolate", interpolation_socket),
+                                  WebSocketRoute("/vts/enhance_sequence", enhancement_socket)]},
             inbrowser=True,
             share=False,
             allowed_paths=[str(OUTPUTS.resolve())],
