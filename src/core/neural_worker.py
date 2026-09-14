@@ -78,6 +78,20 @@ class Worker:
             if self.scratch is not None:
                 self.scratch.cleanup(); self.scratch = None
 
+    def cleanup(self):
+        """Clean an existing child without creating one for a non-neural job."""
+        with self.lock:
+            if self.process is None or self.process.poll() is not None:
+                return
+            from .jobs import JobController
+            try:
+                self.call(dict(op='cleanup'), JobController(), timeout=30)
+            except Exception:
+                # Completed results are already outside the worker. A failed
+                # cleanup discards it without turning success into render failure.
+                logging.getLogger(__name__).exception('Neural worker cleanup failed')
+                self.stop()
+
     def start(self):
         if self.process is not None and self.process.poll() is None:
             return

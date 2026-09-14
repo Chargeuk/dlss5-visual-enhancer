@@ -26,7 +26,13 @@ def main():
         except EOFError: return
         try:
             op = request['op']
-            if op == 'live_start':
+            if op == 'cleanup':
+                if session is not None:
+                    raise RuntimeError('Cannot clean memory while a neural session is open.')
+                from src.core.memory_cleanup import cleanup_local_memory
+                cleanup_local_memory()
+                response = dict(cleaned=True)
+            elif op == 'live_start':
                 from src.live.pipeline import LiveSession, validate_options
                 validate_options(request['options'])
                 live = LiveSession(request['options'])
@@ -70,11 +76,14 @@ def main():
                 elif op == 'close':
                     session.abort() if request['abort'] else session.close()
                     response = snapshot()
-                    session = None
+                    session = token = None
                     rgba = result = None
                     memory.close(); memory = None
                 else: raise ValueError('Unknown worker operation')
             send(output,response)
+            # A persistent command loop otherwise retains the previous request
+            # (including masks) and video result until another request arrives.
+            request = response = converted = None
         except Exception as exc:
             from src.core.neural_bridge import BRIDGE_MANAGER
             fatal = isinstance(exc, (NeuralBridgePoisonedError, OSError)) or bool(BRIDGE_MANAGER._poisoned_reason)

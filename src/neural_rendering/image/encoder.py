@@ -87,6 +87,21 @@ def _spill_preview(key: str, image: Image.Image) -> None:
     _preview_spill[key] = path
 
 
+def release_preview_memory() -> None:
+    """Release cached thumbnails but preserve previews awaiting GUI delivery."""
+    global _preview_cache_bytes
+    with _preview_cache_lock:
+        for key in list(_preview_cache):
+            image, size = _preview_cache[key]
+            _spill_preview(key, image)
+            # If disk staging failed, keep the only remaining copy of the result.
+            if key not in _preview_spill:
+                continue
+            del _preview_cache[key]
+            _preview_cache_bytes -= size
+            image.close()
+
+
 def make_image_preview(
     rgba: np.ndarray, output_format: str, has_transparency: bool | None = None,
 ) -> Image.Image:

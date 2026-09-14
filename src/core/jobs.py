@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import logging
+import os
 import subprocess
 import threading
 import time
@@ -55,6 +58,9 @@ class JobController:
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE: JobController | None = None
 _WAITING = deque()
+_IDLE_TIMER = None
+_STOPPING_WORKER = False
+IDLE_WORKER_SECONDS = 10.0
 _JOB_CONTEXT = ContextVar("render_job_controller", default=None)
 
 
@@ -71,9 +77,69 @@ def use_job_controller(controller: JobController):
         _JOB_CONTEXT.reset(token)
 
 
+def _cancel_idle_timer_locked():
+    global _IDLE_TIMER
+    timer, _IDLE_TIMER = _IDLE_TIMER, None
+    if timer is not None:
+        timer.cancel()
+
+
+def _stop_idle_worker():
+    from .memory_cleanup import stop_idle_worker
+    stop_idle_worker()
+
+
+def _cleanup_job_memory():
+    from .memory_cleanup import cleanup_job_memory
+    cleanup_job_memory()
+
+
+def _schedule_idle_timer_locked():
+    global _IDLE_TIMER
+    # Child video/live pipelines have their own local queue, but the parent
+    # exclusively owns worker lifetime and the application-wide idle timer.
+    if (_ACTIVE is not None or _WAITING or _IDLE_TIMER is not None or _STOPPING_WORKER
+            or os.environ.get('MERSERK_NEURAL_WORKER') == '1'):
+        return
+
+    def expired():
+        global _IDLE_TIMER, _STOPPING_WORKER
+        with _ACTIVE_LOCK:
+            # cancel() alone cannot stop a callback that has already begun.
+            if _IDLE_TIMER is not timer:
+                return
+            _IDLE_TIMER = None
+            if _ACTIVE is not None or _WAITING:
+                return
+            _STOPPING_WORKER = True
+        # Requests can still enqueue (including ASGI calls) during shutdown,
+        # but none can claim a slot and start using the worker being stopped.
+        try:
+            _stop_idle_worker()
+        except Exception:
+            logging.getLogger(__name__).exception('Idle neural worker shutdown failed')
+        finally:
+            with _ACTIVE_LOCK:
+                _STOPPING_WORKER = False
+
+    timer = threading.Timer(IDLE_WORKER_SECONDS, expired)
+    timer.daemon = True
+    _IDLE_TIMER = timer
+    timer.start()
+
+
+def _cancel_idle_timer():
+    with _ACTIVE_LOCK:
+        _cancel_idle_timer_locked()
+
+
+atexit.register(_cancel_idle_timer)
+
+
 def _enqueue(controller):
     ticket = object()
     with _ACTIVE_LOCK:
+        _cancel_idle_timer_locked()
         _WAITING.append(ticket)
     return ticket
 
@@ -83,7 +149,7 @@ def _try_claim(ticket, controller):
     with _ACTIVE_LOCK:
         if controller.cancel.is_set():
             raise Cancelled("Queued render cancelled.")
-        if _ACTIVE is None and _WAITING and _WAITING[0] is ticket:
+        if not _STOPPING_WORKER and _ACTIVE is None and _WAITING and _WAITING[0] is ticket:
             _WAITING.popleft()
             _ACTIVE = controller
             return True
@@ -99,13 +165,22 @@ def _leave(ticket, controller, claimed):
     global _ACTIVE
     try:
         if claimed:
-            controller.terminate_processes()
+            try:
+                controller.terminate_processes()
+            finally:
+                # Keep ownership until cleanup finishes, including failures and
+                # cancellations. Queued jobs must not lose their allocations.
+                try:
+                    _cleanup_job_memory()
+                except Exception:
+                    logging.getLogger(__name__).exception('Post-job memory cleanup failed')
     finally:
         with _ACTIVE_LOCK:
             if claimed and _ACTIVE is controller:
                 _ACTIVE = None
             with suppress(ValueError):
                 _WAITING.remove(ticket)
+            _schedule_idle_timer_locked()
 
 
 def _report_wait(position):
@@ -173,7 +248,13 @@ async def queued_socket_job(websocket, controller, setup):
             with suppress(BaseException):
                 await disconnected
         finally:
-            _leave(ticket, controller, claimed)
+            cleanup = asyncio.create_task(asyncio.to_thread(_leave, ticket, controller, claimed))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # The cleanup thread retains queue ownership even if the
+                # disconnected request is cancelled again while it is finishing.
+                raise
 
 
 def cancel_active_job() -> str:
