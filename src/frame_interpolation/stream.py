@@ -73,12 +73,30 @@ class InterpolationStream:
             raise
 
     def push(self, encoded, index):
-        if index != self.next_index:
-            raise ValueError("Input frames must arrive once, in sequence.")
         with Image.open(io.BytesIO(encoded)) as source:
             if source.format != "PNG" or source.size != (self.width, self.height):
                 raise ValueError("Every input must be a PNG with the negotiated dimensions.")
             rgba = np.array(source.convert("RGBA"), dtype=np.uint8)
+        outputs, cut = self.push_rgba(rgba, index)
+        encoded_outputs = []
+        for header, pixels in outputs:
+            data = None
+            if pixels is not None:
+                with Image.fromarray(pixels) as image, io.BytesIO() as buffer:
+                    image.save(buffer, format="PNG", compress_level=1)
+                    data = buffer.getvalue()
+                header = dict(header, bytes=len(data))
+            encoded_outputs.append((header, data))
+        return encoded_outputs, cut
+
+    def push_rgba(self, rgba, index, *, force_reset=False):
+        """Accept in-process frames without an intermediate PNG round trip."""
+        if index != self.next_index:
+            raise ValueError("Input frames must arrive once, in sequence.")
+        if rgba.dtype != np.uint8 or rgba.shape != (self.height, self.width, 4):
+            raise ValueError("Expected RGBA8 at the interpolation dimensions.")
+        if force_reset and index:
+            self.segment += 1
         alpha = rgba[..., 3].copy()
         items = [TimedFrame(rgba, Fraction(index, 30), self.segment, "Source", index)]
         cuts_before = self.stages[0].scene_cuts
@@ -87,7 +105,7 @@ class InterpolationStream:
             for item in items:
                 expanded.extend(stage.push(item))
             items = expanded
-        cut = self.stages[0].scene_cuts != cuts_before
+        cut = bool(force_reset and index) or self.stages[0].scene_cuts != cuts_before
         self.segment = self.stages[0].previous.segment
         generated = {item.timestamp: item.rgba for item in items if item.provenance == "DLSSG"}
         outputs = []
@@ -104,10 +122,7 @@ class InterpolationStream:
                 pixels = generated[timestamp]
                 pixels[..., 3] = np.rint(self.previous_alpha.astype(np.float32) * (1 - float(fraction))
                                         + alpha.astype(np.float32) * float(fraction)).astype(np.uint8)
-                with Image.fromarray(pixels) as image, io.BytesIO() as buffer:
-                    image.save(buffer, format="PNG", compress_level=1)
-                    data = buffer.getvalue()
-                outputs.append((dict(type="generated", slot=slot, bytes=len(data)), data))
+                outputs.append((dict(type="generated", slot=slot), pixels))
         self.previous_alpha = alpha
         self.next_index += 1
         return outputs, cut

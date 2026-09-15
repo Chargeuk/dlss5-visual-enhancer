@@ -21,6 +21,7 @@ from ..upscale.video.models import UpscaleOptions
 from ..upscale.video.native import RTXVideoSession, probe_capabilities
 from .video.guides import TemporalGuideGenerator
 from .video.models import ConversionOptions
+from ..frame_interpolation.stream import InterpolationStream
 
 CHUNK_BYTES = 256 * 1024
 IDLE_TIMEOUT = 120
@@ -33,12 +34,22 @@ NEURAL_PARAMETERS = {
 
 
 def validate_setup(value):
-    if not isinstance(value, dict) or value.get("version") != 1:
-        raise ValueError("VTS temporal enhancement protocol version 1 is required.")
+    if not isinstance(value, dict) or value.get("version") not in (1, 2):
+        raise ValueError("VTS temporal enhancement protocol version 1 or 2 is required.")
     allowed = {"version", "width", "height", "target_width", "target_height", "frame_count",
-               "channels", "enable_neural_rendering", "vsr_quality", "parameters", "timeout_seconds", "queue_status"}
+               "channels", "enable_neural_rendering", "vsr_quality", "parameters", "timeout_seconds", "queue_status",
+               "enable_frame_interpolation", "interpolation_multiplier"}
     if value.keys() - allowed:
         raise ValueError("Unknown sequence settings.")
+    enabled = value.get("enable_frame_interpolation", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("enable_frame_interpolation must be a boolean.")
+    if enabled:
+        if value["version"] != 2:
+            raise ValueError("Combined interpolation requires protocol version 2.")
+        multiplier = value.get("interpolation_multiplier", 2)
+        if isinstance(multiplier, bool) or not isinstance(multiplier, int) or multiplier not in (2, 3, 4, 8):
+            raise ValueError("Choose a 2x, 3x, 4x or 8x interpolation multiplier.")
     if not isinstance(value.get("queue_status", False), bool):
         raise ValueError("queue_status must be a boolean.")
     for name in ("width", "height", "target_width", "target_height"):
@@ -109,6 +120,10 @@ class EnhancementSequence:
             self.guides = TemporalGuideGenerator(*self.reduced)
 
     def push(self, encoded, index):
+        rgba, cut = self.push_pixels(encoded, index)
+        return encode_frame(rgba, self.setup["channels"]), cut
+
+    def push_pixels(self, encoded, index):
         if self.controller.cancel.is_set():
             raise Cancelled("Sequence stopped.")
         if index != self.next_index:
@@ -136,10 +151,7 @@ class EnhancementSequence:
         self.next_index += 1
         if self.controller.cancel.is_set():
             raise Cancelled("Sequence stopped.")
-        with Image.fromarray(rgba if mode == "RGBA" else rgba[..., :3]) as result, io.BytesIO() as buffer:
-            result.save(buffer, format="PNG", compress_level=1)
-            png = buffer.getvalue()
-        return png, cut
+        return rgba, cut
 
     def close(self, *, abort=False):
         try:
@@ -164,6 +176,55 @@ class EnhancementSequence:
                 self.neural = self.vsr = self.guides = None
 
 
+def encode_frame(rgba, channels):
+    with Image.fromarray(rgba if channels == 4 else rgba[..., :3]) as image, io.BytesIO() as buffer:
+        image.save(buffer, format="PNG", compress_level=1)
+        return buffer.getvalue()
+
+
+class CombinedEnhancementSequence(EnhancementSequence):
+    """Enhance originals once, then interpolate them in the same queued job."""
+    def __init__(self, setup, controller):
+        super().__init__(setup, controller)
+        self.interpolation = None
+        self.previous = None
+        self.output_frames = 0
+
+    def open(self):
+        super().open()
+        if self.setup.get("enable_frame_interpolation", False) and self.setup["frame_count"] > 1:
+            self.interpolation = InterpolationStream(dict(width=self.target[0], height=self.target[1],
+                frame_count=self.setup["frame_count"], multiplier=self.setup.get("interpolation_multiplier", 2)),
+                self.controller)
+            self.interpolation.open()
+
+    def push_frames(self, encoded, index):
+        rgba, cut = self.push_pixels(encoded, index)
+        frames = []
+        if self.interpolation is not None:
+            generated, interpolation_cut = self.interpolation.push_rgba(rgba, index, force_reset=cut)
+            cut = cut or interpolation_cut
+            for header, pixels in generated:
+                if header["type"] == "repeat":
+                    pixels = self.previous if header["source_index"] == index - 1 else rgba
+                frames.append(pixels)
+            self.previous = rgba
+        frames.append(rgba)
+        self.output_frames += len(frames)
+        return frames, cut
+
+    def close(self, *, abort=False):
+        try:
+            if self.interpolation is not None:
+                self.interpolation.close()
+        finally:
+            self.interpolation = self.previous = None
+            try:
+                super().close(abort=abort)
+            finally:
+                self.stats["output_frames"] = self.output_frames
+
+
 async def enhancement_socket(websocket: WebSocket):
     await websocket.accept()
     controller = JobController()
@@ -171,6 +232,9 @@ async def enhancement_socket(websocket: WebSocket):
     complete = False
     try:
         setup = validate_setup(await asyncio.wait_for(websocket.receive_json(), IDLE_TIMEOUT))
+        combined = setup["version"] == 2
+        multiplier = setup.get("interpolation_multiplier", 2) if setup.get("enable_frame_interpolation", False) else 1
+        output_count = (setup["frame_count"] - 1) * multiplier + 1
         timeout = setup.get("timeout_seconds", 600)
         incoming = asyncio.Queue(maxsize=1)
         max_png_bytes = setup["width"] * setup["height"] * 8 + 1024 * 1024
@@ -214,24 +278,40 @@ async def enhancement_socket(websocket: WebSocket):
 
         async with queued_socket_job(websocket, controller, setup):
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vts-temporal")
-            stream = EnhancementSequence(setup, controller)
+            stream = CombinedEnhancementSequence(setup, controller) if combined else EnhancementSequence(setup, controller)
             receiver = asyncio.create_task(receive_frames())
             try:
                 processing = asyncio.create_task(run(stream.open))
                 await asyncio.shield(processing)
-                await websocket.send_json(dict(type="ready", version=1, chunk_bytes=CHUNK_BYTES,
-                    output_count=setup["frame_count"], width=setup["target_width"], height=setup["target_height"],
+                await websocket.send_json(dict(type="ready", version=setup["version"], chunk_bytes=CHUNK_BYTES,
+                    output_count=output_count, width=setup["target_width"], height=setup["target_height"],
                     channels=setup["channels"]))
+                output_index = 0
                 for index in range(setup["frame_count"]):
                     actual_index, png = await next_input()
-                    processing = asyncio.create_task(run(stream.push, png, actual_index))
-                    output, cut = await asyncio.shield(processing)
+                    processing = asyncio.create_task(run(stream.push_frames if combined else stream.push, png, actual_index))
+                    frames, cut = await asyncio.shield(processing)
                     del png
-                    await asyncio.wait_for(websocket.send_json(dict(type="enhanced", index=index,
-                        bytes=len(output), scene_cut=cut)), timeout)
-                    for offset in range(0, len(output), CHUNK_BYTES):
-                        await asyncio.wait_for(websocket.send_bytes(output[offset:offset + CHUNK_BYTES]), timeout)
-                    del output
+                    if not combined:
+                        frames = [frames]
+                    for frame in frames:
+                        if combined:
+                            processing = asyncio.create_task(run(encode_frame, frame, setup["channels"]))
+                            output = await asyncio.shield(processing)
+                        else:
+                            output = frame
+                        await asyncio.wait_for(websocket.send_json(dict(type="enhanced", index=output_index,
+                            bytes=len(output), scene_cut=cut)), timeout)
+                        for offset in range(0, len(output), CHUNK_BYTES):
+                            await asyncio.wait_for(websocket.send_bytes(output[offset:offset + CHUNK_BYTES]), timeout)
+                        output_index += 1
+                        del output
+                    del frame, frames, processing
+                    processing = None
+                    if combined:
+                        await asyncio.wait_for(websocket.send_json(dict(type="frame_done", index=index)), timeout)
+                if output_index != output_count:
+                    raise RuntimeError("Interpolation returned an incomplete output sequence.")
                 if await next_input() is not None:
                     raise ValueError("Unexpected frames after the end of the sequence.")
                 complete = True
